@@ -1,4 +1,4 @@
-# pgproxy
+# pgbearer
 
 **An identity-aware PostgreSQL gateway for Kubernetes, written in Rust.**
 Log in to PostgreSQL with your OIDC identity (Microsoft Entra ID, Keycloak,
@@ -6,11 +6,14 @@ Okta, Kubernetes ServiceAccounts, GitHub Actions …). There are no database
 passwords to hand out or rotate, and access is governed centrally. It is built
 to run in front of [CloudNativePG](https://cloudnative-pg.io) clusters.
 
+*Present a **bearer** token, get a least-privilege **PostgreSQL** role.*
+
 > [!IMPORTANT]
 > **Status: planning / pre-alpha.** There is no usable code yet. This
 > repository holds the architecture and roadmap. Read
 > [ARCHITECTURE.md](ARCHITECTURE.md) and [PLAN.md](PLAN.md), and feedback is
-> welcome in issues.
+> welcome in issues. The project was planned under the working name
+> *pgproxy*; the repository will be renamed to *pgbearer*.
 
 ---
 
@@ -20,7 +23,7 @@ Most teams still reach production databases with shared passwords kept in
 wikis, vaults and CI variables. Offboarding is manual, audit logs show
 `app_user`, and no one can say who ran which query.
 
-pgproxy moves database access into your identity provider:
+pgbearer moves database access into your identity provider:
 
 - **No database passwords for people.** Users connect with a short-lived
   OIDC access token, sent as the password or natively with psql 18's OAuth
@@ -30,7 +33,7 @@ pgproxy moves database access into your identity provider:
   Workload Identity.
 - **Central, default-deny policy.** IdP app roles, groups and claims map to
   *least-privilege PostgreSQL roles*, per cluster and per database.
-- **The database stays in charge.** pgproxy logs in **as the mapped role**
+- **The database stays in charge.** pgbearer logs in **as the mapped role**
   (certificate authentication, no shared superuser). GRANTs, RLS and pgaudit
   work as usual.
 - **Audit with real identities.** Every connection and decision is logged with
@@ -42,17 +45,17 @@ pgproxy moves database access into your identity provider:
 
 ```mermaid
 flowchart LR
-    U["psql / DBeaver / app<br/>(token as password or OAUTHBEARER)"] -- "TLS, PG protocol" --> P["pgproxy<br/>verify token → policy → role"]
+    U["psql / DBeaver / app<br/>(token as password or OAUTHBEARER)"] -- "TLS, PG protocol" --> P["pgbearer<br/>verify token → policy → role"]
     P -- "JWKS (cached)" --> I[("Entra ID / Keycloak / K8s")]
     P -- "TLS verify-full<br/>cert auth as mapped role" --> C[("CloudNativePG<br/>cluster-rw / -ro")]
 ```
 
 1. The client connects over TLS and presents an access token.
-2. pgproxy validates it (signature, issuer, audience, expiry, tenant, scopes)
+2. pgbearer validates it (signature, issuer, audience, expiry, tenant, scopes)
    against the IdP's cached JWKS.
 3. The policy decides which **PostgreSQL role** the identity may use on which
    cluster and database.
-4. pgproxy uses a pooled backend connection, or opens one, *as that role*
+4. pgbearer uses a pooled backend connection, or opens one, *as that role*
    (certificate auth with `pg_ident`; no passwords), then relays the session
    with full protocol support. That includes the extended protocol,
    pipelining, COPY, LISTEN/NOTIFY and cancellation.
@@ -63,7 +66,7 @@ flowchart LR
 
 ```bash
 export PGPASSWORD=$(az account get-access-token \
-    --scope api://pgproxy/Database.Connect --query accessToken -o tsv)
+    --scope api://pgbearer/Database.Connect --query accessToken -o tsv)
 psql "host=orders.db.example.com dbname=orders user=orders_readonly sslmode=verify-full"
 ```
 
@@ -78,8 +81,8 @@ psql "host=oauth.orders.db.example.com dbname=orders user=orders_readonly \
 **With the companion CLI:**
 
 ```bash
-pgproxyctl login                       # browser (PKCE) or device code
-pgproxyctl psql orders                 # fresh token + TLS settings, then exec psql
+pgbearerctl login                       # browser (PKCE) or device code
+pgbearerctl psql orders                 # fresh token + TLS settings, then exec psql
 ```
 
 **Policy (excerpt):**
@@ -106,7 +109,7 @@ policies:
 | Pooling | Session mode (default) and transaction mode with prepared-statement support; bounded queues; failover-aware |
 | Kubernetes | Helm chart, HPA/PDB/NetworkPolicy, hot reload, SNI routing for many clusters, CNPG `Cluster` watch |
 | Observability | Prometheus metrics, OTLP traces, JSON logs, a dedicated audit event stream |
-| Supply chain | Rust with no `unsafe` in pgproxy's own code, fuzzed parsers, signed multi-arch images, SBOM, SLSA provenance |
+| Supply chain | Rust with no `unsafe` in pgbearer's own code, fuzzed parsers, signed multi-arch images, SBOM, SLSA provenance |
 
 ## Roadmap
 
@@ -116,15 +119,15 @@ policies:
 | `v0.1.0` | **MVP**: OIDC authentication, policy, backend login as mapped role, audit |
 | `v0.2.0` | Pooling: limits, session and transaction mode |
 | `v0.3.0` | Beta: Kubernetes and CloudNativePG integration, Entra ID guide |
-| `v0.4.0` | OAUTHBEARER (psql 18) and `pgproxyctl` |
+| `v0.4.0` | OAUTHBEARER (psql 18) and `pgbearerctl` |
 | `v1.0.0` | Hardened GA: security review, performance targets, stable config API |
 
 Details, exit criteria and risks are in [PLAN.md](PLAN.md).
 
 ## Relationship to gprxy
 
-pgproxy is inspired by [gprxy](https://github.com/sathwick-p/gprxy) (Go),
-which demonstrated SSO tokens as PostgreSQL passwords. pgproxy is a clean-room
+pgbearer is inspired by [gprxy](https://github.com/sathwick-p/gprxy) (Go),
+which demonstrated SSO tokens as PostgreSQL passwords. pgbearer is a clean-room
 reimplementation in Rust. It addresses structural issues found in a review of
 gprxy, summarised in [ARCHITECTURE.md §2](ARCHITECTURE.md#2-lessons-from-gprxy).
 Among them:
@@ -159,4 +162,4 @@ The project is in the design phase. The most useful contributions right now:
 
 ## License
 
-To be decided (proposed: Apache-2.0; see [PLAN.md §10](PLAN.md#10-open-decisions)).
+Licensed under the [Apache License, Version 2.0](LICENSE).

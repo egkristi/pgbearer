@@ -1,4 +1,4 @@
-# pgproxy — Architecture
+# pgbearer — Architecture
 
 > Status: **design draft** (pre-implementation). This document describes the
 > target architecture. [PLAN.md](PLAN.md) describes the order in which it is
@@ -32,7 +32,7 @@
 
 ## 1. Purpose and scope
 
-**pgproxy** is a PostgreSQL wire-protocol proxy that runs in Kubernetes. It
+**pgbearer** is a PostgreSQL wire-protocol proxy that runs in Kubernetes. It
 authenticates clients with **OpenID Connect / OAuth 2.0 access tokens**,
 authorizes them against a central policy, and connects them to PostgreSQL as a
 **least-privilege database role**. It also pools backend connections and writes
@@ -59,7 +59,7 @@ provider (IdP).
 
 - Sharding, query rewriting or multi-backend fan-out (see PgDog/Citus).
 - Acting as an identity provider or issuing tokens.
-- Replacing PostgreSQL's own privilege system. pgproxy decides *which role* you
+- Replacing PostgreSQL's own privilege system. pgbearer decides *which role* you
   get. PostgreSQL GRANTs and RLS decide *what that role may do*.
 - GSSAPI/Kerberos for clients.
 
@@ -71,7 +71,7 @@ provider (IdP).
 tokens sent as the PostgreSQL password and mapped to service accounts. A review
 of its source found these structural problems, and they shape this design:
 
-| # | gprxy behaviour | Consequence | pgproxy approach |
+| # | gprxy behaviour | Consequence | pgbearer approach |
 |---|---|---|---|
 | L1 | The role-mapped service account is only used on a *temporary* authentication connection. Queries run on pooled connections that always log in with the global `GPRXY_USER`/`GPRXY_PASS`. | Role-based access control is not enforced on the data path. Every user gets the global service account's privileges. | The backend session logs in **as the role the policy chose** (§9). Pools are keyed by `(backend, database, role)`. |
 | L2 | Each client login opens two backend connections (a temporary one for authentication, then a pooled one). | Double connection churn and latency, and the client sees ParameterStatus values from a different session. | One backend session per client session (session mode). Parameters are synthesized from the real backend (§7.4). |
@@ -104,7 +104,7 @@ flowchart LR
     idp[("OIDC IdP<br/>Entra ID / Keycloak / …")]
     k8sapi[("Kubernetes API<br/>TokenReview, CNPG CRs")]
     subgraph Cluster["Kubernetes cluster"]
-        pgp["pgproxy<br/>(Deployment, N replicas)"]
+        pgp["pgbearer<br/>(Deployment, N replicas)"]
         cnpg[("CloudNativePG<br/>Cluster(s)")]
     end
     obs[("Prometheus / OTLP /<br/>log pipeline / SIEM")]
@@ -120,9 +120,9 @@ flowchart LR
     pgp -- "metrics, traces, audit" --> obs
 ```
 
-**Trust boundaries:** (a) client to pgproxy over the network, possibly from
-outside the cluster; (b) pgproxy to the IdP over the internet; (c) pgproxy to
-PostgreSQL inside the cluster; (d) pgproxy to the Kubernetes API.
+**Trust boundaries:** (a) client to pgbearer over the network, possibly from
+outside the cluster; (b) pgbearer to the IdP over the internet; (c) pgbearer to
+PostgreSQL inside the cluster; (d) pgbearer to the Kubernetes API.
 
 ---
 
@@ -131,13 +131,13 @@ PostgreSQL inside the cluster; (d) pgproxy to the Kubernetes API.
 ```mermaid
 flowchart TB
     lb["Service type LoadBalancer / internal LB<br/>(L4 TCP, optional PROXY protocol v2)"]
-    subgraph nsproxy["namespace: pgproxy"]
+    subgraph nsproxy["namespace: pgbearer"]
         direction TB
-        p1["pgproxy pod 1"]
-        p2["pgproxy pod 2"]
-        p3["pgproxy pod N"]
+        p1["pgbearer pod 1"]
+        p2["pgbearer pod 2"]
+        p3["pgbearer pod N"]
         hs["headless Service<br/>(peer discovery: cancel forwarding)"]
-        cm["ConfigMap: pgproxy.yaml<br/>(hot reload)"]
+        cm["ConfigMap: pgbearer.yaml<br/>(hot reload)"]
         sec["Secrets: listener TLS (cert-manager),<br/>backend client certs, CA bundles"]
     end
     subgraph nsdata["namespace: data"]
@@ -160,11 +160,11 @@ flowchart TB
   its own pools.
 - **Ports:** `5432` for PostgreSQL clients; `9090` for the admin HTTP server
   (`/livez`, `/readyz`, `/metrics`, admin API); `6543` for peer cancel
-  forwarding, reachable only from other pgproxy pods through NetworkPolicy.
+  forwarding, reachable only from other pgbearer pods through NetworkPolicy.
 - **PodDisruptionBudget**, topology spread across zones, anti-affinity per
   node.
 - **HorizontalPodAutoscaler** on CPU plus the custom metric
-  `pgproxy_client_connections` (through KEDA or prometheus-adapter).
+  `pgbearer_client_connections` (through KEDA or prometheus-adapter).
 - **Security context:** non-root, read-only root filesystem, all
   capabilities dropped, `seccompProfile: RuntimeDefault`. The image is
   distroless or static.
@@ -207,7 +207,7 @@ Triggered by SIGTERM or the admin API:
 | Gateway API `TCPRoute` | Any client. The gateway does L4 forwarding only. |
 
 **Multi-tenant routing by SNI:** libpq has sent SNI since PostgreSQL 14
-(`sslsni=1`), both after `SSLRequest` and with direct TLS. One pgproxy
+(`sslsni=1`), both after `SSLRequest` and with direct TLS. One pgbearer
 deployment can front many CNPG clusters, for example
 `orders.db.example.com` and `billing.db.example.com`, behind one load balancer,
 using a wildcard certificate.
@@ -217,32 +217,32 @@ using a wildcard certificate.
 ## 5. Component view (Rust workspace)
 
 ```text
-pgproxy/
+pgbearer/
 ├── crates/
-│   ├── pgproxy-wire/       # PG protocol codec: framing, message views, startup/SSL/GSS/cancel,
-│   │                       # protocol 3.0/3.2 negotiation. No I/O policy. Fuzzed.
-│   ├── pgproxy-tls/        # rustls server/client configs, SNI/ALPN, cert hot-reload
-│   ├── pgproxy-auth/       # OIDC discovery, JWKS cache, JWT validation, claim mapping,
-│   │                       # SASL OAUTHBEARER (server), TokenReview, backend auth (SCRAM/cert)
-│   ├── pgproxy-policy/     # Identity model, policy rules → Decision
-│   ├── pgproxy-pool/       # Endpoints, discovery (static/DNS/CNPG), pools, health, limits
-│   ├── pgproxy-session/    # Client session state machine, relay, txn pooling,
-│   │                       # prepared-statement tracking, cancel registry & peer forwarding
-│   ├── pgproxy-audit/      # Audit event model + sinks
-│   ├── pgproxy-telemetry/  # tracing, metrics registry, OTLP
-│   ├── pgproxy-config/     # Typed config, JSON schema, validation, hot reload (arc-swap)
-│   ├── pgproxy-k8s/        # (feature "kubernetes") CNPG watchers, Secret watchers, CRDs (later)
-│   ├── pgproxy/            # bin: the proxy server (wiring, admin HTTP via axum)
-│   └── pgproxyctl/         # bin: CLI — login (PKCE/device), token, connect, doctor
-├── deploy/helm/pgproxy/    # Helm chart
-├── deploy/examples/        # CNPG + Entra ID, CNPG + Keycloak, kind dev setup
-├── docs/adr/               # Architecture Decision Records
-├── fuzz/                   # cargo-fuzz targets (wire codec, SASL, JWT parsing)
-└── tests/                  # integration + e2e harness (testcontainers, kind)
+│   ├── pgbearer-wire/       # PG protocol codec: framing, message views, startup/SSL/GSS/cancel,
+│   │                        # protocol 3.0/3.2 negotiation. No I/O policy. Fuzzed.
+│   ├── pgbearer-tls/        # rustls server/client configs, SNI/ALPN, cert hot-reload
+│   ├── pgbearer-auth/       # OIDC discovery, JWKS cache, JWT validation, claim mapping,
+│   │                        # SASL OAUTHBEARER (server), TokenReview, backend auth (SCRAM/cert)
+│   ├── pgbearer-policy/     # Identity model, policy rules → Decision
+│   ├── pgbearer-pool/       # Endpoints, discovery (static/DNS/CNPG), pools, health, limits
+│   ├── pgbearer-session/    # Client session state machine, relay, txn pooling,
+│   │                        # prepared-statement tracking, cancel registry & peer forwarding
+│   ├── pgbearer-audit/      # Audit event model + sinks
+│   ├── pgbearer-telemetry/  # tracing, metrics registry, OTLP
+│   ├── pgbearer-config/     # Typed config, JSON schema, validation, hot reload (arc-swap)
+│   ├── pgbearer-k8s/        # (feature "kubernetes") CNPG watchers, Secret watchers, CRDs (later)
+│   ├── pgbearer/            # bin: the proxy server (wiring, admin HTTP via axum)
+│   └── pgbearerctl/         # bin: CLI — login (PKCE/device), token, connect, doctor
+├── deploy/helm/pgbearer/    # Helm chart
+├── deploy/examples/         # CNPG + Entra ID, CNPG + Keycloak, kind dev setup
+├── docs/adr/                # Architecture Decision Records
+├── fuzz/                    # cargo-fuzz targets (wire codec, SASL, JWT parsing)
+└── tests/                   # integration + e2e harness (testcontainers, kind)
 ```
 
-Dependency direction: `wire ← auth/session ← pool ← pgproxy`. `policy` depends
-only on the identity types. No crate depends on `pgproxy-k8s` except the binary
+Dependency direction: `wire ← auth/session ← pool ← pgbearer`. `policy` depends
+only on the identity types. No crate depends on `pgbearer-k8s` except the binary
 (behind a feature flag), so the proxy also runs outside Kubernetes.
 
 ### 5.1 Key crates (initial choices, confirmed in ADRs)
@@ -278,7 +278,7 @@ vectors come from `postgres-protocol`, PgDog and pgcat. This is ADR-002.
 sequenceDiagram
     autonumber
     participant C as Client (psql)
-    participant P as pgproxy
+    participant P as pgbearer
     participant I as IdP (JWKS, cached)
     participant B as PostgreSQL (CNPG -rw)
 
@@ -404,7 +404,7 @@ the client's tracked parameters (`client_encoding`, `DateStyle`, `TimeZone`,
 `IntervalStyle`, `application_name`, `extra_float_digits`, `search_path`,
 `standard_conforming_strings`, plus `-c` entries in `options`).
 `options` entries that would bypass policy are rejected with `28000`. These
-are `role`, `session_authorization`, and any `pgproxy.*` GUC.
+are `role`, `session_authorization`, and any `pgbearer.*` GUC.
 
 ---
 
@@ -458,7 +458,7 @@ raw token ─► size check ─► JWT? ──no──► introspection (RFC 766
 - Background refresh at `max(Cache-Control max-age, min_refresh)`, capped at
   `max_age` (default 1 h).
 - **Unknown `kid`:** a single-flight refresh with a minimum interval (default
-  30 s) per issuer, so an attacker cannot turn pgproxy into a JWKS-fetch
+  30 s) per issuer, so an attacker cannot turn pgbearer into a JWKS-fetch
   amplifier.
 - **Stale-while-error:** if refresh fails, keep the last good key set for up to
   `max_stale` (default 24 h), raise an alert metric, and never drop to an empty
@@ -482,9 +482,9 @@ raw token ─► size check ─► JWT? ──no──► introspection (RFC 766
   and service principals.
 - **Groups overage (Entra ID):** with more than 200 groups, a JWT carries no
   `groups` claim, only `_claim_names`/`_claim_sources` (or `hasgroups`).
-  pgproxy detects this. The default is to **fail closed** for group-based
+  pgbearer detects this. The default is to **fail closed** for group-based
   rules, with a clear audit reason. An optional resolver can query Microsoft
-  Graph `transitiveMemberOf` with pgproxy's own workload identity and a cache
+  Graph `transitiveMemberOf` with pgbearer's own workload identity and a cache
   (PLAN Phase 7). The recommended fix is to emit only "groups assigned to the
   application".
 
@@ -559,14 +559,14 @@ Phase 7) behind the same `PolicyEngine` trait.
 
 ### 9.2 Backend identity strategies
 
-pgproxy must log in to PostgreSQL **as the chosen role**, so that PostgreSQL's
+pgbearer must log in to PostgreSQL **as the chosen role**, so that PostgreSQL's
 privilege system, RLS, `current_user` and pgaudit all see the effective role.
 There are three ways to authenticate that login:
 
 | Strategy | How | Pros | Cons |
 |---|---|---|---|
-| **A. Certificate + `pg_ident` (recommended)** | pgproxy holds **one** client certificate (CN=`pgproxy`) from the cluster's client CA. In `pg_ident.conf`, `pgproxy pgproxy +pgproxy_login` lets that certificate log in as any **member of `pgproxy_login`** (`+role` syntax, PostgreSQL 16+). | No passwords anywhere. One secret to rotate (automatic with CNPG or cert-manager). The set of reachable roles is controlled *in the database* through `GRANT pgproxy_login TO …`. | Needs PostgreSQL 16+ for `+role` (on 14–15, list roles explicitly). The certificate must be distributed to the pgproxy namespace. |
-| **B. Per-role client certificates** | A CNPG 1.30+ `DatabaseRole` with `clientCertificate: {}` issues `<role>-client-cert` Secrets, and pgproxy mounts one per role. | Native CNPG with automatic renewal. No `pg_ident` map needed. | One secret per role. |
+| **A. Certificate + `pg_ident` (recommended)** | pgbearer holds **one** client certificate (CN=`pgbearer`) from the cluster's client CA. In `pg_ident.conf`, `pgbearer pgbearer +pgbearer_login` lets that certificate log in as any **member of `pgbearer_login`** (`+role` syntax, PostgreSQL 16+). | No passwords anywhere. One secret to rotate (automatic with CNPG or cert-manager). The set of reachable roles is controlled *in the database* through `GRANT pgbearer_login TO …`. | Needs PostgreSQL 16+ for `+role` (on 14–15, list roles explicitly). The certificate must be distributed to the pgbearer namespace. |
+| **B. Per-role client certificates** | A CNPG 1.30+ `DatabaseRole` with `clientCertificate: {}` issues `<role>-client-cert` Secrets, and pgbearer mounts one per role. | Native CNPG with automatic renewal. No `pg_ident` map needed. | One secret per role. |
 | **C. Per-role passwords** | SCRAM-SHA-256 with passwords from Secrets (CNPG `passwordSecret`). | Works with any PostgreSQL (including managed services outside Kubernetes). | Passwords to rotate. The proxy holds many credentials. |
 
 **Why not one "authenticator" login plus `SET ROLE`** (the PostgREST pattern)?
@@ -581,26 +581,26 @@ semantics under the DBA's control.
 **Role design guidance** (shipped as docs and examples):
 
 ```sql
-CREATE ROLE pgproxy_login NOLOGIN;                         -- gate for strategy A (no privileges)
-CREATE ROLE orders_readonly LOGIN IN ROLE pgproxy_login;   -- reachable through pgproxy
+CREATE ROLE pgbearer_login NOLOGIN;                        -- gate for strategy A (no privileges)
+CREATE ROLE orders_readonly LOGIN IN ROLE pgbearer_login;  -- reachable through pgbearer
 GRANT pg_read_all_data TO orders_readonly;                 -- or fine-grained grants
--- Membership is transitive: never GRANT a pgproxy-reachable role TO a privileged role,
--- and never make superuser / CREATEROLE / REPLICATION / BYPASSRLS roles members of pgproxy_login.
+-- Membership is transitive: never GRANT a pgbearer-reachable role TO a privileged role,
+-- and never make superuser / CREATEROLE / REPLICATION / BYPASSRLS roles members of pgbearer_login.
 ```
 
-**Role safety check:** when a pool for a role is first created, pgproxy
+**Role safety check:** when a pool for a role is first created, pgbearer
 reads `pg_roles` for that role. It refuses to use roles with `rolsuper`,
 `rolcreaterole`, `rolreplication` or `rolbypassrls` unless the grant sets
 `allow_privileged_role: true` (meant for break-glass grants). It logs the
-role's effective memberships. `pgproxyctl doctor` runs the same check
-offline against every role reachable through `pgproxy_login`.
+role's effective memberships. `pgbearerctl doctor` runs the same check
+offline against every role reachable through `pgbearer_login`.
 
 ### 9.3 Identity propagation (audit, not authorization)
 
-On every checkout pgproxy sets session-level GUCs, `pgproxy.sub`,
-`pgproxy.username` and `pgproxy.session_id`. It can also append the identity
+On every checkout pgbearer sets session-level GUCs, `pgbearer.sub`,
+`pgbearer.username` and `pgbearer.session_id`. It can also append the identity
 to `application_name` (opt-in, because some apps read it). These values make
-PostgreSQL logs and `pg_stat_activity` correlatable with pgproxy's audit log.
+PostgreSQL logs and `pg_stat_activity` correlatable with pgbearer's audit log.
 
 > ⚠️ A client can overwrite these GUCs within its own session. They are
 > **audit hints, not a security boundary**. Do not base RLS policies on them.
@@ -653,7 +653,7 @@ used over TLS.
 ### 10.4 Session parameters
 
 Each pooled connection records its current tracked parameters. On checkout,
-pgproxy compares them with the client's desired set and sends one `SET …;`
+pgbearer compares them with the client's desired set and sends one `SET …;`
 batch for the differences before forwarding client traffic. `ParameterStatus`
 replies keep the record accurate. This is the same approach as PgBouncer's
 `track_extra_parameters`, but applied to every tracked parameter.
@@ -667,7 +667,7 @@ replies keep the record accurate. This is the same approach as PgBouncer's
 
 Transaction mode includes **protocol-level prepared-statement
 virtualisation**. Named `Parse` messages are renamed to content-addressed
-names (`__pgp_<hash>`). pgproxy tracks which backend connection has which
+names (`__pgb_<hash>`). pgbearer tracks which backend connection has which
 statement prepared, and injects `Parse` before `Bind` on connections that do
 not have it yet. `Close` is handled locally, and an LRU per connection is
 bounded by `max_prepared_statements`. This is the approach of PgBouncer 1.21+
@@ -675,12 +675,12 @@ and PgDog. Session-state statements in transaction mode (`SET` without
 `LOCAL`, `LISTEN`, SQL `PREPARE`, advisory locks, temporary tables) are handled
 according to `transaction_mode.session_state: warn | pin | error`. `pin` keeps
 the backend bound for the rest of the session. Detecting these statements
-needs the `sql-inspect` feature; without it, pgproxy only documents the
+needs the `sql-inspect` feature; without it, pgbearer only documents the
 limitation, as PgBouncer does.
 
 ### 10.6 CloudNativePG failover and switchover
 
-pgproxy watches the `Cluster` CR. When `currentPrimary` changes:
+pgbearer watches the `Cluster` CR. When `currentPrimary` changes:
 
 1. Mark `rw` pools for that cluster as **stale**: no new checkouts from them,
    and idle connections are closed immediately.
@@ -692,7 +692,7 @@ pgproxy watches the `Cluster` CR. When `currentPrimary` changes:
 3. New connections go to the `-rw` Service, which CNPG has already moved to
    the new primary.
 
-The CR watch lets pgproxy react before TCP timeouts would. It is
+The CR watch lets pgbearer react before TCP timeouts would. It is
 optimisation only. Without Kubernetes API access, connection errors trigger the
 same pool invalidation.
 
@@ -701,9 +701,9 @@ same pool invalidation.
 ## 11. Query cancellation across replicas
 
 PostgreSQL sends a `CancelRequest` on a **new** TCP connection, which the load
-balancer may route to a **different** pgproxy replica.
+balancer may route to a **different** pgbearer replica.
 
-- pgproxy **never exposes backend keys**. Each client session gets a
+- pgbearer **never exposes backend keys**. Each client session gets a
   proxy-generated key: `pid` (32 bit) = `replica_tag (12 bit) | session_seq
   (20 bit)`, and `secret` = CSPRNG bytes (4 bytes with protocol 3.0, 32 bytes
   with 3.2). The `replica_tag` is a hash of the pod name, so every replica can
@@ -744,38 +744,38 @@ much longer. Policy, configurable per grant:
 
 PostgreSQL has no in-band re-authentication, so a client cannot refresh the
 token on an open session. Pools in applications (HikariCP, pgx pool, and
-others) handle reconnects transparently, and `pgproxyctl` refreshes tokens
+others) handle reconnects transparently, and `pgbearerctl` refreshes tokens
 before connecting.
 
 ---
 
 ## 13. Configuration model
 
-- A **single YAML file** (`pgproxy.yaml`), versioned (`apiVersion:
-  pgproxy.io/v1alpha1`), with a published **JSON Schema** for editor
+- A **single YAML file** (`pgbearer.yaml`), versioned (`apiVersion:
+  pgbearer/v1alpha1`), with a published **JSON Schema** for editor
   validation. Unknown fields are an error.
 - **Secrets are referenced as files** (`*_file`), mounted from Kubernetes
   Secrets. Environment variables are only for overrides
-  (`PGPROXY_LOG_LEVEL`, …).
+  (`PGBEARER_LOG_LEVEL`, …).
 - **Hot reload:** a file watcher, plus SIGHUP, plus `POST /admin/reload`. The new
   configuration is fully parsed and validated, and the JWKS of new issuers is
   pre-fetched, *before* an atomic swap (`arc-swap`). Existing sessions keep
   their decision. New sessions use the new snapshot. An invalid configuration
   is rejected, the old one stays active, and the
-  `pgproxy_config_reload_errors_total` metric is incremented.
+  `pgbearer_config_reload_errors_total` metric is incremented.
 - TLS certificates (listener and backend client certificates) are reloaded on
   file change, which handles cert-manager and CNPG rotation without a restart.
 
 ```yaml
-apiVersion: pgproxy.io/v1alpha1
+apiVersion: pgbearer/v1alpha1
 kind: ProxyConfig
 
 listeners:
   - name: postgres
     address: "0.0.0.0:5432"
     tls:
-      cert_file: /etc/pgproxy/tls/tls.crt
-      key_file: /etc/pgproxy/tls/tls.key
+      cert_file: /etc/pgbearer/tls/tls.crt
+      key_file: /etc/pgbearer/tls/tls.key
       min_version: "1.2"
       direct_tls: true                 # PG17+ sslnegotiation=direct (ALPN "postgresql")
     proxy_protocol: optional           # off | optional | required
@@ -785,29 +785,29 @@ identity_providers:
   - name: entra
     type: entra
     issuer: "https://login.microsoftonline.com/<tenant-id>/v2.0"
-    audiences: ["<pgproxy-api-client-id>"]      # Entra v2 tokens: aud = API client ID
+    audiences: ["<pgbearer-api-client-id>"]     # Entra v2 tokens: aud = API client ID
     tenants: ["<tenant-id>"]
     required_scopes: ["Database.Connect"]       # delegated (user) tokens
     oauthbearer:                                # used only by oauthbearer listeners
-      scope: "api://pgproxy/Database.Connect"
+      scope: "api://pgbearer/Database.Connect"
   - name: k8s
     type: kubernetes
     validation: token_review                    # or: jwks
-    audiences: ["pgproxy"]
+    audiences: ["pgbearer"]
   - name: github
     type: github-actions
-    audiences: ["pgproxy"]
+    audiences: ["pgbearer"]
 
 backends:
   - name: orders
     cnpg: { cluster: orders-db, namespace: data, service: rw }
     tls:
       mode: verify-full
-      ca_file: /etc/pgproxy/backends/orders/ca.crt
+      ca_file: /etc/pgbearer/backends/orders/ca.crt
     login:
       method: cert                              # cert | password
-      cert_file: /etc/pgproxy/backends/orders/client/tls.crt
-      key_file: /etc/pgproxy/backends/orders/client/tls.key
+      cert_file: /etc/pgbearer/backends/orders/client/tls.crt
+      key_file: /etc/pgbearer/backends/orders/client/tls.key
     pool:
       max_backend_connections: 80
       max_connections: 20
@@ -837,7 +837,7 @@ audit:
 
 ## 14. CloudNativePG integration
 
-### 14.1 What pgproxy needs from a CNPG cluster
+### 14.1 What pgbearer needs from a CNPG cluster
 
 ```yaml
 apiVersion: postgresql.cnpg.io/v1
@@ -848,16 +848,16 @@ metadata:
 spec:
   instances: 3
   imageName: ghcr.io/cloudnative-pg/postgresql:18
-  # Optional (CNPG 1.29+): restrict cert logins to pgproxy pods when they run in this namespace
+  # Optional (CNPG 1.29+): restrict cert logins to pgbearer pods when they run in this namespace
   # podSelectorRefs:
-  #   - name: pgproxy
-  #     selector: { matchLabels: { app.kubernetes.io/name: pgproxy } }
+  #   - name: pgbearer
+  #     selector: { matchLabels: { app.kubernetes.io/name: pgbearer } }
   postgresql:
     pg_ident:
-      - "pgproxy pgproxy +pgproxy_login"
+      - "pgbearer pgbearer +pgbearer_login"
     pg_hba:
       # Must come before any broader rule for these users (first match wins).
-      - "hostssl all +pgproxy_login all cert map=pgproxy"
+      - "hostssl all +pgbearer_login all cert map=pgbearer"
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: DatabaseRole                      # CNPG 1.30+
@@ -868,41 +868,41 @@ spec:
   cluster: { name: orders-db }
   name: orders_readonly
   login: true
-  inRoles: [pgproxy_login, pg_read_all_data]   # pgproxy_login: another DatabaseRole with login: false
+  inRoles: [pgbearer_login, pg_read_all_data]   # pgbearer_login: another DatabaseRole with login: false
 ```
 
-### 14.2 Getting the pgproxy client certificate
+### 14.2 Getting the pgbearer client certificate
 
 | Option | Description |
 |---|---|
-| **cert-manager** (recommended) | CNPG in "user-provided client CA" mode with a cert-manager `Issuer` backed by that CA. A `Certificate` with `commonName: pgproxy` is issued **directly into the pgproxy namespace**. Rotation is handled by cert-manager, and pgproxy hot-reloads. |
-| CNPG `DatabaseRole` with `clientCertificate` (1.30+) | Create a `DatabaseRole` named `pgproxy` (LOGIN, no privileges) with `clientCertificate: {}`. The Secret `pgproxy-client-cert` is created in the *cluster's* namespace. Either run pgproxy in that namespace, or replicate the Secret (External Secrets, Reflector) into the pgproxy namespace. |
+| **cert-manager** (recommended) | CNPG in "user-provided client CA" mode with a cert-manager `Issuer` backed by that CA. A `Certificate` with `commonName: pgbearer` is issued **directly into the pgbearer namespace**. Rotation is handled by cert-manager, and pgbearer hot-reloads. |
+| CNPG `DatabaseRole` with `clientCertificate` (1.30+) | Create a `DatabaseRole` named `pgbearer` (LOGIN, no privileges) with `clientCertificate: {}`. The Secret `pgbearer-client-cert` is created in the *cluster's* namespace. Either run pgbearer in that namespace, or replicate the Secret (External Secrets, Reflector) into the pgbearer namespace. |
 | `kubectl cnpg certificate` | Manual or one-off. Not recommended for production rotation. |
 
-The `pgproxy-k8s` watcher can also read the `<cluster>-ca` and client
+The `pgbearer-k8s` watcher can also read the `<cluster>-ca` and client
 certificate Secrets directly through the API (RBAC-scoped) instead of volume
 mounts. This option is evaluated in Phase 4 **[open]**.
 
 ### 14.3 Relationship to the CNPG `Pooler` (PgBouncer)
 
-pgproxy connects **directly to `<cluster>-rw` / `-ro`** and does its own pooling.
+pgbearer connects **directly to `<cluster>-rw` / `-ro`** and does its own pooling.
 Placing it in front of a CNPG `Pooler` is possible but not recommended:
 PgBouncer would need to authenticate as every mapped role, which defeats
 strategy A. Applications with static credentials can keep using the CNPG
-Pooler alongside pgproxy.
+Pooler alongside pgbearer.
 
 ### 14.4 PostgreSQL 18 native OAuth
 
 PostgreSQL 18 can validate OAuth tokens itself through a server-side
 **validator module** (`oauth_validator_libraries`, `pg_hba` method `oauth`).
-pgproxy complements that rather than competing with it:
+pgbearer complements that rather than competing with it:
 
-- pgproxy works with **PostgreSQL 14–18** and with every driver. Native OAuth
+- pgbearer works with **PostgreSQL 14–18** and with every driver. Native OAuth
   requires libpq 18 clients, and today most non-libpq drivers do not support
   it.
-- pgproxy centralises policy, audit and pooling across **many clusters** and
+- pgbearer centralises policy, audit and pooling across **many clusters** and
   needs no validator module in the database image.
-- pgproxy **speaks OAUTHBEARER to clients** (§8.1). A PostgreSQL 18 user gets
+- pgbearer **speaks OAUTHBEARER to clients** (§8.1). A PostgreSQL 18 user gets
   the native psql device-flow UX either way.
 
 ---
@@ -911,8 +911,8 @@ pgproxy complements that rather than competing with it:
 
 ### 15.1 App registrations
 
-1. **`pgproxy` (resource API):**
-   - *Expose an API*: App ID URI `api://pgproxy`, delegated scope
+1. **`pgbearer` (resource API):**
+   - *Expose an API*: App ID URI `api://pgbearer`, delegated scope
      `Database.Connect`.
    - *App roles* (for example `Orders.Reader`, `Orders.Owner`) with *allowed
      member types: Users/Groups + Applications*. Use them in policies
@@ -922,20 +922,20 @@ pgproxy complements that rather than competing with it:
      tokens are v1 (`iss = https://sts.windows.net/<tid>/`), which does not
      match the v2 discovery document.
    - If your tenant's app management policy requires it, use
-     `api://<client-id>` instead of `api://pgproxy` throughout.
+     `api://<client-id>` instead of `api://pgbearer` throughout.
    - Enterprise application: *Assignment required = Yes*, so only assigned
      users and groups can obtain tokens at all.
    - Optional groups claim: "Groups assigned to the application" (avoids
      overage).
-2. **`pgproxy-cli` (public client):** "Allow public client flows" (device
+2. **`pgbearer-cli` (public client):** "Allow public client flows" (device
    code), redirect URI `http://localhost` (PKCE loopback), and API permission
-   `api://pgproxy/Database.Connect` with admin consent.
+   `api://pgbearer/Database.Connect` with admin consent.
 3. **Azure CLI convenience:** pre-authorize the Azure CLI client application
-   on the `pgproxy` API. Users can then get a token without any pgproxy tooling:
+   on the `pgbearer` API. Users can then get a token without any pgbearer tooling:
 
    ```bash
    export PGPASSWORD=$(az account get-access-token \
-       --scope api://pgproxy/Database.Connect --query accessToken -o tsv)
+       --scope api://pgbearer/Database.Connect --query accessToken -o tsv)
    psql "host=orders.db.example.com dbname=orders user=orders_readonly sslmode=verify-full"
    ```
 
@@ -944,7 +944,7 @@ pgproxy complements that rather than competing with it:
    ```bash
    psql "host=oauth.orders.db.example.com dbname=orders user=orders_readonly \
          oauth_issuer=https://login.microsoftonline.com/<tenant-id>/v2.0 \
-         oauth_client_id=<pgproxy-cli-client-id>"
+         oauth_client_id=<pgbearer-cli-client-id>"
    # → "Visit https://microsoft.com/devicelogin and enter the code: XXXX-XXXX"
    ```
 
@@ -965,10 +965,10 @@ pgproxy complements that rather than competing with it:
 ### 15.3 Workloads on AKS
 
 Pods with **Azure Workload Identity** use the client-credentials flow for
-`api://pgproxy/.default`. The token carries app `roles` assigned to the managed
+`api://pgbearer/.default`. The token carries app `roles` assigned to the managed
 identity or service principal. For workloads inside the same Kubernetes cluster,
 the **`kubernetes` issuer type is simpler**: a projected ServiceAccount token
-with `audience: pgproxy` needs no Entra configuration.
+with `audience: pgbearer` needs no Entra configuration.
 
 ---
 
@@ -981,21 +981,21 @@ the audit log.
 
 | Metric | Labels |
 |---|---|
-| `pgproxy_client_connections` (gauge) | `listener`, `state` |
-| `pgproxy_auth_attempts_total` | `issuer`, `result`, `reason` |
-| `pgproxy_auth_duration_seconds` (histogram) | `issuer` |
-| `pgproxy_policy_decisions_total` | `result`, `grant` |
-| `pgproxy_pool_connections` (gauge) | `backend`, `database`, `role`, `state` |
-| `pgproxy_pool_acquire_duration_seconds` (histogram) | `backend` |
-| `pgproxy_pool_acquire_timeouts_total` | `backend` |
-| `pgproxy_backend_connect_errors_total` | `backend`, `reason` |
-| `pgproxy_transactions_total`, `pgproxy_transaction_duration_seconds` | `backend`, `mode` |
-| `pgproxy_bytes_total` | `direction` |
-| `pgproxy_cancel_requests_total` | `result` (`local`, `forwarded`, `unknown`) |
-| `pgproxy_jwks_refresh_total`, `pgproxy_jwks_age_seconds` | `issuer`, `result` |
-| `pgproxy_tls_cert_expiry_timestamp_seconds` | `cert` |
-| `pgproxy_config_reload_total`, `pgproxy_config_reload_errors_total` | — |
-| `pgproxy_sessions_terminated_total` | `reason` (`token_expired`, `drain`, `idle`, `lifetime`) |
+| `pgbearer_client_connections` (gauge) | `listener`, `state` |
+| `pgbearer_auth_attempts_total` | `issuer`, `result`, `reason` |
+| `pgbearer_auth_duration_seconds` (histogram) | `issuer` |
+| `pgbearer_policy_decisions_total` | `result`, `grant` |
+| `pgbearer_pool_connections` (gauge) | `backend`, `database`, `role`, `state` |
+| `pgbearer_pool_acquire_duration_seconds` (histogram) | `backend` |
+| `pgbearer_pool_acquire_timeouts_total` | `backend` |
+| `pgbearer_backend_connect_errors_total` | `backend`, `reason` |
+| `pgbearer_transactions_total`, `pgbearer_transaction_duration_seconds` | `backend`, `mode` |
+| `pgbearer_bytes_total` | `direction` |
+| `pgbearer_cancel_requests_total` | `result` (`local`, `forwarded`, `unknown`) |
+| `pgbearer_jwks_refresh_total`, `pgbearer_jwks_age_seconds` | `issuer`, `result` |
+| `pgbearer_tls_cert_expiry_timestamp_seconds` | `cert` |
+| `pgbearer_config_reload_total`, `pgbearer_config_reload_errors_total` | — |
+| `pgbearer_sessions_terminated_total` | `reason` (`token_expired`, `drain`, `idle`, `lifetime`) |
 
 The Helm chart ships a `ServiceMonitor`, a `PrometheusRule` (alerts: JWKS stale,
 certificate expiring, pool saturation, authentication-failure spike), and a
@@ -1023,7 +1023,7 @@ documented):
 | `statement` (opt-in) | `session_id`, `fingerprint` (`pg_query`) or redacted text, `duration`, `rows`, `sqlstate` |
 | `cancel` | `session_id`, `result` |
 
-`backend_pid` and the GUC `pgproxy.session_id` join the audit trail to
+`backend_pid` and the GUC `pgbearer.session_id` join the audit trail to
 PostgreSQL logs and pgaudit output.
 
 ---
@@ -1038,7 +1038,7 @@ PostgreSQL logs and pgaudit output.
 | Token replay against another service | Strict `aud`; a `typ=at+jwt` check where the IdP issues RFC 9068 tokens; `azp`/`appid` allow-list; short token lifetimes in the IdP. |
 | Forged tokens or algorithm confusion | Algorithm allow-list, no `none`/HS*, the configured issuer decides the JWKS (never the `jku`/`x5u` headers). |
 | Escalation through `SET ROLE` | Log in as the mapped role (§9.2); policy GUCs and `role` blocked in startup `options`. |
-| Lateral movement via the backend credential | Strategy A is limited to `pgproxy_login` members, and superusers are excluded. pg_hba restricts the certificate login to proxy pod IPs (CNPG `podSelectorRefs`) and NetworkPolicy. |
+| Lateral movement via the backend credential | Strategy A is limited to `pgbearer_login` members, and superusers are excluded. pg_hba restricts the certificate login to proxy pod IPs (CNPG `podSelectorRefs`) and NetworkPolicy. |
 | Pre-authentication DoS (slowloris, huge packets) | Pre-auth size and time limits, `max_pending_auth` connections, per-IP connection and authentication-failure rate limits. |
 | IdP amplification via random `kid` | Single-flight, rate-limited JWKS refresh (§8.3). |
 | Cancel abuse | Proxy-issued keys with 32-byte secrets on 3.2; rate limiting; never a backend key. |
@@ -1062,7 +1062,7 @@ PostgreSQL logs and pgaudit output.
   are parsed. Bodies move between `BytesMut` buffers with vectored writes. Large
   messages are streamed with a known remaining length.
 - **Backpressure:** bounded per-connection buffers (default 64 KiB, max 1 MiB).
-  If the client reads slowly, pgproxy stops reading from the backend. pgproxy
+  If the client reads slowly, pgbearer stops reading from the backend. pgbearer
   never accumulates result sets in memory.
 - **Per-connection memory target:** ≤ 32 KiB idle, so 10 000 clients use
   roughly 320 MiB.
@@ -1107,5 +1107,5 @@ PostgreSQL logs and pgaudit output.
 | **PostgreSQL 18 native OAuth only** | Requires libpq 18 clients and a validator module per cluster. No pooling, and no cross-cluster policy or audit (§14.4). Complementary. |
 | **`pgwire` crate** | Built for implementing servers, with full decode. Not optimal for a streaming proxy (§5.1). |
 | **Shared authenticator + `SET ROLE`** | Escalation via `RESET ROLE` (§9.2). |
-| **Sidecar per application** | Gives per-pod identity for free but multiplies connections and pools, and does not serve humans. pgproxy can still run as a sidecar if needed. |
+| **Sidecar per application** | Gives per-pod identity for free but multiplies connections and pools, and does not serve humans. pgbearer can still run as a sidecar if needed. |
 | **Service mesh (Istio/Linkerd) mTLS only** | Workload-to-workload identity, but no end-user identity, no PostgreSQL-level role mapping and no audit of database identity. |
