@@ -490,7 +490,7 @@ These need the project owner's input. Proposed defaults are in **bold**.
 
 | # | Decision | Options | Proposal |
 |---|---|---|---|
-| D1 | Licence | **Apache-2.0**, MIT/Apache dual, MPL-2.0 (gprxy's), AGPL | **Apache-2.0**: patent grant, CNCF-friendly, compatible with the ecosystem. pgproxy is a clean-room implementation, so gprxy's MPL-2.0 does not apply. |
+| D1 | Licence | — | ✅ **Decided: Apache-2.0** (see [LICENSE](LICENSE)). Patent grant, CNCF-friendly. pgproxy is a clean-room implementation, so gprxy's MPL-2.0 does not apply. |
 | D2 | Project and binary name | `pgproxy` (generic; other projects use the name), something distinctive | Keep `pgproxy` for the repo. Check registry and crates.io conflicts before v0.1.0. |
 | D3 | Default `user_semantics` | `role`, `identity`, **`auto`** | **`auto`**: an entitled role name selects that role; the identity's own name or `*` selects the default role. |
 | D4 | Default pool mode | **`session`**, `transaction` | **`session`** (compatibility first). |
@@ -498,7 +498,7 @@ These need the project owner's input. Proposed defaults are in **bold**.
 | D6 | Config format | **YAML** (with JSON Schema), TOML | **YAML**: Kubernetes-native; the schema gives editor validation. |
 | D7 | How pgproxy reads CNPG Secrets | **Volume mounts**, API watch | **Mounts** for v1 (less RBAC); API watch as an option in Phase 4. |
 | D8 | Minimum supported PostgreSQL | **14**, 16 | **14** (oldest supported by CNPG); strategy A documented as 16+. |
-| D9 | Docs language | **English**, Norwegian | **English** for the code repository; translations later if needed. |
+| D9 | Docs language | — | ✅ **Decided: English.** |
 
 ## 11. ADR backlog
 

@@ -159,4 +159,4 @@ The project is in the design phase. The most useful contributions right now:
 
 ## License
 
-To be decided (proposed: Apache-2.0; see [PLAN.md §10](PLAN.md#10-open-decisions)).
+Licensed under the [Apache License, Version 2.0](LICENSE).
