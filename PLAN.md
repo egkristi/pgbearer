@@ -1,4 +1,4 @@
-# pgproxy — Implementation Plan & Roadmap
+# pgbearer — Implementation Plan & Roadmap
 
 > Status: **planning**. This plan turns [ARCHITECTURE.md](ARCHITECTURE.md) into
 > phases with concrete deliverables and exit criteria. Durations are
@@ -29,7 +29,7 @@
 > in the identity provider, not through passwords spread across wikis,
 > vaults and CI variables.*
 
-pgproxy is an identity-aware PostgreSQL gateway, written in Rust. It accepts
+pgbearer is an identity-aware PostgreSQL gateway, written in Rust. It accepts
 OIDC tokens from people (Entra ID, Keycloak, …) and from workloads
 (Kubernetes ServiceAccounts, Azure Workload Identity, GitHub Actions). It maps
 them through a central policy to least-privilege PostgreSQL roles and connects
@@ -47,8 +47,8 @@ PostgreSQL 18 OAUTHBEARER, direct TLS/SNI routing). See ARCHITECTURE §2.
 1. **Correctness before features.** The relay must be protocol-correct for
    every mainstream driver before any optimisation or extra feature.
 2. **Secure by default.** TLS required for tokens, default deny, fail closed,
-   no secrets in logs, no unsafe code in pgproxy's own crates.
-3. **The database stays in charge of privileges.** pgproxy decides *which
+   no secrets in logs, no unsafe code in pgbearer's own crates.
+3. **The database stays in charge of privileges.** pgbearer decides *which
    role* you get. PostgreSQL decides *what the role can do*.
 4. **Kubernetes-native, not Kubernetes-only.** Every feature also works with a
    static config file outside Kubernetes. Kubernetes integrations are
@@ -79,7 +79,7 @@ PostgreSQL 18 OAUTHBEARER, direct TLS/SNI routing). See ARCHITECTURE §2.
 - Kubernetes: Helm chart, probes, drain, HPA, PDB, NetworkPolicy,
   ServiceMonitor, alerts, dashboard. Cancel forwarding between replicas.
 - Observability: Prometheus metrics, JSON logs, OTLP traces, audit stream.
-- `pgproxyctl`: login (PKCE + device code), token, connect, doctor.
+- `pgbearerctl`: login (PKCE + device code), token, connect, doctor.
 - Supply chain: signed multi-arch images, SBOM, provenance.
 
 **Out of scope for v1.0** (candidates for Phase 7)
@@ -97,7 +97,7 @@ PostgreSQL 18 OAUTHBEARER, direct TLS/SNI routing). See ARCHITECTURE §2.
 | Correctness | No known protocol desyncs. The fuzzers run ≥ 1 h per release without new crashes. |
 | Security | No high or critical findings open at release. Third-party review before 1.0. Threat model updated each minor release. |
 | Performance | Session-mode overhead p99 < 100 µs per round trip. ≥ 90 % of direct `pgbench -S` TPS at 64 clients. ≤ 32 KiB memory per idle client. |
-| Availability | Zero failed client reconnects after a CNPG switchover in the e2e test (beyond the one expected error per in-flight session). Rolling upgrade of pgproxy without failed new connections. |
+| Availability | Zero failed client reconnects after a CNPG switchover in the e2e test (beyond the one expected error per in-flight session). Rolling upgrade of pgbearer without failed new connections. |
 | Operability | Install to first authenticated `psql` session in < 15 minutes following the CNPG + Entra ID guide. |
 
 ## 5. Roadmap at a glance
@@ -150,9 +150,13 @@ review.
       issuer (in-process, `rcgen`-generated keys, configurable claims) and
       client drivers.
 - [ ] `docs/adr/` with template; ADR-001 … ADR-004 written ([ADR backlog](#11-adr-backlog)).
+- [x] Licence file: Apache-2.0 ([decision D1](#10-open-decisions)).
 - [ ] `SECURITY.md` (disclosure process), `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`,
-      licence file ([decision D1](#10-open-decisions)), issue and PR templates, Renovate or
-      Dependabot.
+      issue and PR templates, Renovate or Dependabot.
+- [ ] Rename the GitHub repository from `pgproxy` to `pgbearer`
+      ([decision D2](#10-open-decisions)). Claim the `pgbearer` GitHub organisation
+      and container namespaces, and publish the first real crate in Phase 1.
+      crates.io discourages placeholder crates.
 - [ ] Threat model v0 (`docs/threat-model.md`, STRIDE per trust boundary).
 
 **Exit criteria:** CI green on an empty workspace. `just dev-up` starts the
@@ -166,39 +170,39 @@ full local stack. ADR-001 to 004 accepted.
 backend. Client authentication is a development-only stub, behind the
 `dev-insecure` cargo feature and excluded from release builds.
 
-**`pgproxy-wire`**
+**`pgbearer-wire`**
 - [ ] Startup-phase decoding: StartupMessage (3.0/3.2), SSLRequest,
       GSSENCRequest, CancelRequest, direct-TLS detection.
 - [ ] Header-only framing for regular messages; streaming of large bodies.
-- [ ] Typed views for the messages pgproxy must inspect: ReadyForQuery,
+- [ ] Typed views for the messages pgbearer must inspect: ReadyForQuery,
       ErrorResponse, ParameterStatus, BackendKeyData, Authentication*,
       Parse/Bind/Close, Copy*, Terminate.
-- [ ] Encoders for messages pgproxy generates (errors, auth requests,
+- [ ] Encoders for messages pgbearer generates (errors, auth requests,
       ParameterStatus, BackendKeyData, NegotiateProtocolVersion).
 - [ ] Pre-auth limits (startup ≤ 10 000 bytes, password ≤ 16 KiB, timeouts).
 - [ ] cargo-fuzz targets for every decoder, plus property tests (round trip).
 
-**`pgproxy-tls`**
+**`pgbearer-tls`**
 - [ ] rustls server: SSLRequest upgrade, direct TLS with ALPN `postgresql`, SNI
       capture.
 - [ ] rustls client to backend: `verify-full` / `verify-ca` / `require`, client
       certificates.
 - [ ] Certificate hot reload (file watch), expiry metric.
 
-**`pgproxy-session` (session mode, 1:1)**
+**`pgbearer-session` (session mode, 1:1)**
 - [ ] Connection state machine (§6.1).
 - [ ] Full-duplex relay with protocol tracking (§7.3): transaction status,
       pending Sync, COPY state, FATAL detection, Terminate interception.
 - [ ] Backend authentication client: SCRAM-SHA-256 (+PLUS), certificate,
       MD5 for legacy.
 - [ ] Startup parameter synthesis from the real backend (§7.4); blocking of
-      `role`, `session_authorization` and `pgproxy.*` in `options`.
+      `role`, `session_authorization` and `pgbearer.*` in `options`.
 - [ ] Proxy-generated cancel keys, local cancel registry, forwarding to the
       backend (single replica).
 - [ ] Protocol version negotiation (3.0 ↔ 3.2 translation).
 - [ ] Optional PROXY protocol v2 on listeners.
 
-**`pgproxy` binary**
+**`pgbearer` binary**
 - [ ] Config loading (static YAML, schema validation).
 - [ ] Admin HTTP: `/livez`, `/readyz`, `/metrics` (initial metrics).
 - [ ] Graceful shutdown and drain (§4.3) with `TaskTracker` and
@@ -212,7 +216,7 @@ backend. Client authentication is a development-only stub, behind the
 - [ ] Scenario tests: extended protocol with pipelining, errors mid-pipeline,
       COPY in/out (text and binary), LISTEN/NOTIFY while idle, cancel, 1 GB
       result stream, notices, `client_encoding` changes.
-- [ ] Benchmark harness: pgbench direct vs through pgproxy; results published as
+- [ ] Benchmark harness: pgbench direct vs through pgbearer; results published as
       a CI artifact with a regression gate (± 10 %).
 
 **Exit criteria:** the compatibility suite passes against PostgreSQL 14–18.
@@ -226,7 +230,7 @@ No desync under fuzzed message sequences. Overhead is measured and documented.
 **Goal:** the first useful release. Developers and workloads log in with
 tokens and get the right role on a CNPG cluster in a dev Kubernetes cluster.
 
-**`pgproxy-auth`**
+**`pgbearer-auth`**
 - [ ] Issuer registry from config. Issuer selection by exact `iss` match.
 - [ ] OIDC discovery and JWKS cache: background refresh, single-flight and
       rate-limited unknown-`kid` refresh, stale-while-error, readiness gating
@@ -240,7 +244,7 @@ tokens and get the right role on a CNPG cluster in a dev Kubernetes cluster.
       `kubernetes` (JWKS mode), `github-actions`.
 - [ ] Token-as-password authentication on TLS listeners. Non-TLS is refused.
 
-**`pgproxy-policy`**
+**`pgbearer-policy`**
 - [ ] Policy model (§9.1): grants, deny rules, default deny,
       `user_semantics`.
 - [ ] Decision type with matched grants and limits. Pure and fully
@@ -253,13 +257,13 @@ tokens and get the right role on a CNPG cluster in a dev Kubernetes cluster.
       (per-role password from files).
 - [ ] Role safety check against `pg_roles` (no superuser, CREATEROLE,
       REPLICATION or BYPASSRLS unless explicitly allowed).
-- [ ] Identity propagation GUCs (`pgproxy.sub`, `pgproxy.session_id`, …).
+- [ ] Identity propagation GUCs (`pgbearer.sub`, `pgbearer.session_id`, …).
 
 **Session lifetime (§12)**
 - [ ] `on_token_expiry`, grace, `max_lifetime`, idle and
       idle-in-transaction timeouts.
 
-**Audit (`pgproxy-audit`)**
+**Audit (`pgbearer-audit`)**
 - [ ] Event schema v1 (§16.3) for connection, session and cancel events.
       Stdout sink.
 - [ ] A precise denial reason in audit, a generic one to the client.
@@ -318,7 +322,7 @@ passes in both modes. → **`v0.2.0`**.
 **Goal:** production-grade operation in Kubernetes with first-class CNPG
 support.
 
-- [ ] `pgproxy-k8s`: watch CNPG `Cluster` resources (`currentPrimary`, phase)
+- [ ] `pgbearer-k8s`: watch CNPG `Cluster` resources (`currentPrimary`, phase)
       and invalidate pools on switchover (§10.6).
 - [ ] `cnpg` backend kind: service resolution (`rw`/`ro`/`r`), CA from
       `<cluster>-ca`.
@@ -337,10 +341,10 @@ support.
 - [ ] Examples and guides:
   - [ ] CNPG + cert-manager client CA + strategy A (recommended setup).
   - [ ] CNPG 1.30 `DatabaseRole` with `clientCertificate` (strategy B).
-  - [ ] CNPG `podSelectorRefs` to pin certificate logins to pgproxy pod IPs.
+  - [ ] CNPG `podSelectorRefs` to pin certificate logins to pgbearer pod IPs.
   - [ ] **Entra ID guide**: app registrations, app roles, v2 tokens, Azure CLI
         pre-authorization, AKS Workload Identity.
-- [ ] e2e on kind (CI): CNPG switchover (`kubectl cnpg promote`), pgproxy
+- [ ] e2e on kind (CI): CNPG switchover (`kubectl cnpg promote`), pgbearer
       rolling update, pod kill, node drain, certificate rotation, config
       reload, all under load.
 
@@ -358,22 +362,22 @@ reaches a first session in < 15 minutes. → **`v0.3.0` (beta)**.
       through the same pipeline.
 - [ ] Interop tests with libpq/psql 18 built-in device flow against Keycloak
       and Entra ID.
-- [ ] `pgproxyctl`:
+- [ ] `pgbearerctl`:
   - [ ] `login`: authorization code + PKCE (loopback) and device code; token
         cache in the OS keychain; refresh tokens.
   - [ ] `token`: prints a fresh access token
-        (`PGPASSWORD=$(pgproxyctl token) psql …`).
+        (`PGPASSWORD=$(pgbearerctl token) psql …`).
   - [ ] `connect` / `psql`: wrapper that execs psql with token and TLS settings.
   - [ ] `doctor`: checks TLS, issuer reachability, token claims against
         policy (dry run), and CNPG role safety (§9.2).
   - [ ] `explain`: shows which grants match a given token (local policy
         evaluation).
   - [ ] Distribution: Homebrew, Scoop, winget, `.deb`/`.rpm`, `cargo install`;
-        kubectl plugin via Krew (`kubectl pgproxy connect`).
+        kubectl plugin via Krew (`kubectl pgbearer connect`).
 - [ ] libpq "service file" (`pg_service.conf`) generator for teams.
 
 **Exit criteria:** psql 18 connects through device flow against Entra ID
-without any extra tool. `pgproxyctl` works on Linux, macOS and Windows.
+without any extra tool. `pgbearerctl` works on Linux, macOS and Windows.
 → **`v0.4.0`**.
 
 ---
@@ -411,9 +415,10 @@ issues. → **`v1.0.0`**.
    role memberships reconciled and inactive roles removed. `current_user` is
    the human, which gives exact pgaudit attribution and RLS on the real
    identity. Optional output as CNPG `DatabaseRole` resources for GitOps.
-2. **CRDs and controller.** `PgProxyRoute` and `PgProxyAccessPolicy` so
+2. **CRDs and controller.** `PgBearerRoute` and `PgBearerAccessPolicy` so
    application teams can own their access policy next to their CNPG cluster,
-   with RBAC-delegated and validating admission.
+   with RBAC-delegated and validating admission. The CRD API group needs a DNS
+   domain the project controls (to be registered).
 3. **Just-in-time elevated access.** Time-bound grants (for example "owner role
    for 1 h") requested via CLI or chat, approved by a second person, fully
    audited, auto-expiring. Break-glass with mandatory reason.
@@ -474,11 +479,11 @@ and keys, plus periodic live checks).
 |---|---|---|---|
 | Protocol edge cases (pipelining, COPY, error recovery) cause desyncs | High | Medium | Header-only relay with minimal state; golden transcripts; fuzzing; broad driver matrix from Phase 1. |
 | Transaction-mode semantics surprise users | Medium | High | Session mode by default; explicit opt-in per grant; `sql-inspect` detection; clear docs, like PgBouncer's. |
-| Token lifetime vs long sessions (disconnects every ~1 h) | Medium | High | `terminate_when_idle` with grace; configurable per grant; app pools reconnect transparently; `pgproxyctl` refreshes. |
+| Token lifetime vs long sessions (disconnects every ~1 h) | Medium | High | `terminate_when_idle` with grace; configurable per grant; app pools reconnect transparently; `pgbearerctl` refreshes. |
 | Entra ID specifics (v1/v2 tokens, overage, guest users) | Medium | Medium | Dedicated `entra` preset; nightly real-tenant tests; guide with a manifest checklist; fail closed on overage. |
 | `pg_ident +role` needs PostgreSQL 16+ | Low | Medium | Explicit role lists for 14–15; strategies B and C as alternatives. |
 | Connection budget exceeded under HPA | High | Medium | Chart-time validation; runtime metric and alert; Phase 7 shared budget. |
-| A compromised proxy can log in as any `pgproxy_login` member | High | Low | Role safety checks; certificate-login pinning to proxy pod IPs; NetworkPolicy; least-privilege role design; short-lived certificates; audit. |
+| A compromised proxy can log in as any `pgbearer_login` member | High | Low | Role safety checks; certificate-login pinning to proxy pod IPs; NetworkPolicy; least-privilege role design; short-lived certificates; audit. |
 | Dependency or supply-chain vulnerability | High | Low | cargo-deny/audit, minimal dependencies, pinned versions, signed releases, SBOM. |
 | Unmaintained crates (for example YAML) | Low | Medium | Wrap behind internal modules; ADR on choices; Renovate. |
 | Scope creep (sharding, query rewriting) | Medium | Medium | Explicit non-goals; Phase 7 backlog gated by ADRs. |
@@ -490,13 +495,13 @@ These need the project owner's input. Proposed defaults are in **bold**.
 
 | # | Decision | Options | Proposal |
 |---|---|---|---|
-| D1 | Licence | — | ✅ **Decided: Apache-2.0** (see [LICENSE](LICENSE)). Patent grant, CNCF-friendly. pgproxy is a clean-room implementation, so gprxy's MPL-2.0 does not apply. |
-| D2 | Project and binary name | `pgproxy` (generic; other projects use the name), something distinctive | Keep `pgproxy` for the repo. Check registry and crates.io conflicts before v0.1.0. |
+| D1 | Licence | — | ✅ **Decided: Apache-2.0** (see [LICENSE](LICENSE)). Patent grant, CNCF-friendly. pgbearer is a clean-room implementation, so gprxy's MPL-2.0 does not apply. |
+| D2 | Project and binary name | — | ✅ **Decided: `pgbearer`** (replaces the working name `pgproxy`, which several other projects use). The name means "present a bearer token, get a least-privilege PostgreSQL role", and it follows the pgbouncer/pgbackrest naming convention. It was chosen from 34 vetted candidates; the runner-up was `keyphant`. It is free on crates.io, npm, PyPI and Docker Hub, and no same-name project, product or company was found. Before 1.0, run a formal trademark search: "BEARER" is a US trademark of Bearer SAS (Cycode) for a code-security scanner, a different product category, and "bearer" itself is the generic RFC 6750 term. |
 | D3 | Default `user_semantics` | `role`, `identity`, **`auto`** | **`auto`**: an entitled role name selects that role; the identity's own name or `*` selects the default role. |
 | D4 | Default pool mode | **`session`**, `transaction` | **`session`** (compatibility first). |
 | D5 | Default `on_token_expiry` | `terminate`, **`terminate_when_idle`**, `ignore` | **`terminate_when_idle`** with 5 minutes grace and 12 h max lifetime. |
 | D6 | Config format | **YAML** (with JSON Schema), TOML | **YAML**: Kubernetes-native; the schema gives editor validation. |
-| D7 | How pgproxy reads CNPG Secrets | **Volume mounts**, API watch | **Mounts** for v1 (less RBAC); API watch as an option in Phase 4. |
+| D7 | How pgbearer reads CNPG Secrets | **Volume mounts**, API watch | **Mounts** for v1 (less RBAC); API watch as an option in Phase 4. |
 | D8 | Minimum supported PostgreSQL | **14**, 16 | **14** (oldest supported by CNPG); strategy A documented as 16+. |
 | D9 | Docs language | — | ✅ **Decided: English.** |
 
