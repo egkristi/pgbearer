@@ -1,0 +1,35 @@
+[package]
+name = "pgbearer-session"
+description = "Client session handling for pgbearer: startup, TLS, token auth, policy, parameter sync, full-duplex relay, cancellation, expiry and drain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+pgbearer-core = { workspace = true }
+pgbearer-config = { workspace = true }
+pgbearer-wire = { workspace = true }
+pgbearer-tls = { workspace = true }
+pgbearer-auth = { workspace = true }
+pgbearer-policy = { workspace = true }
+pgbearer-pool = { workspace = true }
+pgbearer-audit = { workspace = true }
+pgbearer-telemetry = { workspace = true }
+arc-swap = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
+secrecy = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

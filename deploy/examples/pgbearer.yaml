@@ -1,0 +1,108 @@
+# Example pgbearer configuration: CloudNativePG cluster "orders-db",
+# Microsoft Entra ID for people, Kubernetes ServiceAccounts for workloads,
+# GitHub Actions for migrations.
+apiVersion: pgbearer/v1alpha1
+kind: ProxyConfig
+
+admin:
+  address: "0.0.0.0:9090"
+
+listeners:
+  - name: postgres
+    address: "0.0.0.0:5432"
+    tls:
+      cert_file: /etc/pgbearer/tls/tls.crt
+      key_file: /etc/pgbearer/tls/tls.key
+      min_version: "1.2"
+      direct_tls: true
+    proxy_protocol: optional
+    client_auth: token_password
+
+identity_providers:
+  - name: entra
+    type: entra
+    issuer: "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0"
+    audiences: ["11111111-1111-1111-1111-111111111111"]   # the pgbearer API's client ID
+    tenants: ["00000000-0000-0000-0000-000000000000"]
+    required_scopes: ["Database.Connect"]
+  - name: k8s
+    type: kubernetes
+    audiences: ["pgbearer"]
+    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+  - name: github
+    type: github-actions
+    audiences: ["pgbearer"]
+
+backends:
+  - name: orders
+    cnpg:
+      cluster: orders-db
+      namespace: data
+      service: rw
+    tls:
+      mode: verify-full
+      ca_file: /etc/pgbearer/backends/orders/ca.crt
+    login:
+      method: cert
+      cert_file: /etc/pgbearer/backends/orders/client/tls.crt
+      key_file: /etc/pgbearer/backends/orders/client/tls.key
+    pool:
+      max_backend_connections: 80
+      max_connections: 20
+      acquire_timeout: 5s
+
+routes:
+  - match: { sni: "orders.db.example.com" }
+    backend: orders
+  - match: { databases: ["orders"] }
+    backend: orders
+
+policies:
+  - name: orders-analysts
+    when:
+      issuer: entra
+      roles_any: ["Orders.Analyst"]
+    grant:
+      backend: orders
+      databases: ["orders"]
+      pg_roles: ["orders_readonly"]
+      default_pg_role: orders_readonly
+      max_connections_per_identity: 5
+
+  - name: orders-api
+    when:
+      issuer: k8s
+      subject: "system:serviceaccount:orders:orders-api"
+    grant:
+      backend: orders
+      databases: ["orders"]
+      pg_roles: ["orders_app"]
+      default_pg_role: orders_app
+
+  - name: orders-migrations
+    when:
+      issuer: github
+      subject: "repo:acme/orders:environment:production"
+    grant:
+      backend: orders
+      databases: ["orders"]
+      pg_roles: ["orders_owner"]
+      default_pg_role: orders_owner
+      session_max_lifetime: 30m
+
+deny:
+  - name: no-guests
+    when:
+      issuer: entra
+      claims:
+        - name: acct
+          equals: 1
+
+session:
+  on_token_expiry: terminate_when_idle
+  token_expiry_grace: 5m
+  max_lifetime: 12h
+
+audit:
+  stdout: true

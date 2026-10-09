@@ -1,0 +1,35 @@
+[package]
+name = "pgbearer-auth"
+description = "OIDC token validation for pgbearer: discovery, JWKS cache, JWT validation, claim mapping, SASL OAUTHBEARER"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+pgbearer-core = { workspace = true }
+pgbearer-config = { workspace = true }
+pgbearer-telemetry = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+secrecy = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+arc-swap = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+axum = { workspace = true }
+rcgen = { workspace = true }
+
+[lints]
+workspace = true
