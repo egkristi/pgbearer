@@ -255,3 +255,19 @@ fn credential_resolution_prefers_role_entries() {
         })
     );
 }
+
+#[test]
+fn cloudnativepg_example_values_config_is_valid() {
+    #[derive(serde::Deserialize)]
+    struct HelmValues {
+        config: Config,
+    }
+    let text = include_str!("../../../deploy/examples/cloudnativepg/values.yaml");
+    let values: HelmValues = serde_saphyr::from_str(text).expect("values.yaml parses");
+    values.config.validate().expect("example config validates");
+    let orders = values.config.backend("orders").expect("orders backend");
+    assert_eq!(
+        orders.tls_server_name().as_deref(),
+        Some("orders-db-rw.data.svc.cluster.local")
+    );
+}

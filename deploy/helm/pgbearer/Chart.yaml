@@ -1,0 +1,17 @@
+apiVersion: v2
+name: pgbearer
+description: Identity-aware PostgreSQL gateway — OIDC bearer tokens to least-privilege PostgreSQL roles, built for CloudNativePG.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+license: Apache-2.0
+home: https://github.com/egkristi/pgbearer
+sources:
+  - https://github.com/egkristi/pgbearer
+keywords:
+  - postgresql
+  - proxy
+  - oidc
+  - entra-id
+  - cloudnativepg
+  - security

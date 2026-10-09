@@ -1,0 +1,93 @@
+# Helm values for pgbearer in front of the "orders-db" CloudNativePG cluster
+# from cluster.yaml, with Entra ID for people and Kubernetes ServiceAccount
+# tokens for workloads.
+#
+#   helm install pgbearer deploy/helm/pgbearer -n data -f deploy/examples/cloudnativepg/values.yaml
+
+listenerTls:
+  # A cert-manager Certificate for orders.db.example.com (not shown).
+  secretName: pgbearer-listener-tls
+
+extraSecretMounts:
+  # CNPG's operator-managed server CA (key ca.crt) to verify orders-db-rw.
+  - name: orders-server-ca
+    secretName: orders-db-ca
+    mountPath: /etc/pgbearer/backends/orders/ca
+    items:
+      - key: ca.crt
+        path: ca.crt
+  # pgbearer's client certificate (CN=pgbearer) from cert-manager.
+  - name: orders-client
+    secretName: pgbearer-orders-client
+    mountPath: /etc/pgbearer/backends/orders/client
+
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+
+networkPolicy:
+  enabled: true
+
+rbac:
+  serviceAccountIssuerDiscovery: true   # for the "k8s" identity provider below
+
+config:
+  apiVersion: pgbearer/v1alpha1
+  kind: ProxyConfig
+  admin:
+    address: "0.0.0.0:9090"
+  listeners:
+    - name: postgres
+      address: "0.0.0.0:5432"
+      tls:
+        cert_file: /etc/pgbearer/tls/tls.crt
+        key_file: /etc/pgbearer/tls/tls.key
+  identity_providers:
+    - name: entra
+      type: entra
+      issuer: "https://login.microsoftonline.com/<tenant-id>/v2.0"
+      audiences: ["<pgbearer-api-client-id>"]
+      tenants: ["<tenant-id>"]
+      required_scopes: ["Database.Connect"]
+    - name: k8s
+      type: kubernetes
+      # The issuer must equal the "iss" of projected tokens in your cluster
+      # (kubectl get --raw /.well-known/openid-configuration | jq -r .issuer).
+      issuer: "https://kubernetes.default.svc.cluster.local"
+      audiences: ["pgbearer"]
+      discovery_url: "https://kubernetes.default.svc/.well-known/openid-configuration"
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+  backends:
+    - name: orders
+      cnpg:
+        cluster: orders-db
+        namespace: data
+        service: rw
+      tls:
+        mode: verify-full
+        ca_file: /etc/pgbearer/backends/orders/ca/ca.crt
+      login:
+        method: cert
+        cert_file: /etc/pgbearer/backends/orders/client/tls.crt
+        key_file: /etc/pgbearer/backends/orders/client/tls.key
+  routes:
+    - match: { databases: ["orders"] }
+      backend: orders
+  policies:
+    - name: orders-analysts
+      when: { issuer: entra, roles_any: ["Orders.Analyst"] }
+      grant:
+        backend: orders
+        databases: ["orders"]
+        pg_roles: ["orders_readonly"]
+        default_pg_role: orders_readonly
+        max_connections_per_identity: 5
+    - name: orders-api
+      when: { issuer: k8s, subject: "system:serviceaccount:orders:orders-api" }
+      grant:
+        backend: orders
+        databases: ["orders"]
+        pg_roles: ["orders_app"]
+        default_pg_role: orders_app

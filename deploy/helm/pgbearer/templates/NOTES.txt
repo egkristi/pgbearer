@@ -1,0 +1,16 @@
+pgbearer {{ .Chart.AppVersion }} is deployed as {{ include "pgbearer.fullname" . }}.
+
+PostgreSQL endpoint:  {{ include "pgbearer.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+Health and metrics:   {{ include "pgbearer.fullname" . }}-admin.{{ .Release.Namespace }}.svc:{{ .Values.admin.port }} (/livez, /readyz, /metrics)
+
+Connect with an access token as the password, for example with Entra ID:
+
+  export PGPASSWORD=$(az account get-access-token --scope api://pgbearer/Database.Connect --query accessToken -o tsv)
+  psql "host=<your-host> dbname=<db> user=<role> sslmode=verify-full"
+
+Pods become ready only after the JWKS of every required identity provider is loaded.
+{{- if not .Values.listenerTls.secretName }}
+
+WARNING: listenerTls.secretName is empty. Unless your configuration sets
+insecure_allow_plaintext_auth, pgbearer will refuse to start without listener TLS.
+{{- end }}

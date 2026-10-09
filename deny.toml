@@ -1,0 +1,43 @@
+# cargo-deny configuration: licences, advisories, bans and sources.
+# Run locally with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# OpenSSL is not used; all TLS goes through rustls.
+deny = [
+    { crate = "openssl", reason = "pgbearer uses rustls" },
+    { crate = "openssl-sys", reason = "pgbearer uses rustls" },
+    { crate = "native-tls", reason = "pgbearer uses rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

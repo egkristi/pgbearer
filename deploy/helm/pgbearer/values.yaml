@@ -1,0 +1,142 @@
+# Default values for pgbearer.
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/egkristi/pgbearer
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# The pgbearer configuration (pgbearer.yaml), rendered into a ConfigMap.
+# See deploy/examples/pgbearer.yaml and ARCHITECTURE.md §13. File paths in the
+# config must match the mounts below:
+#   listener TLS:      /etc/pgbearer/tls/tls.crt, /etc/pgbearer/tls/tls.key
+#   secret mounts:     whatever you set in extraSecretMounts[].mountPath
+config:
+  apiVersion: pgbearer/v1alpha1
+  kind: ProxyConfig
+  admin:
+    address: "0.0.0.0:9090"
+  listeners:
+    - name: postgres
+      address: "0.0.0.0:5432"
+      tls:
+        cert_file: /etc/pgbearer/tls/tls.crt
+        key_file: /etc/pgbearer/tls/tls.key
+  identity_providers: []
+  backends: []
+  routes: []
+  policies: []
+
+# Restart pods when the configuration changes. Policy, routes and session
+# settings can be hot-reloaded, but listeners, identity providers and
+# backends need a restart, so rolling on change is the safe default.
+rollOnConfigChange: true
+
+# Secret with the listener certificate (keys tls.crt and tls.key), for example
+# issued by cert-manager. Mounted at /etc/pgbearer/tls.
+listenerTls:
+  secretName: ""
+
+# Additional Secrets to mount: backend CA bundles, client certificates,
+# password files.
+# - name: orders-backend
+#   secretName: orders-db-ca          # CNPG "<cluster>-ca" (key ca.crt)
+#   mountPath: /etc/pgbearer/backends/orders
+extraSecretMounts: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # Needed when an identity provider of type "kubernetes" reads the API
+  # server's discovery document with the pod's token.
+  automountServiceAccountToken: true
+
+rbac:
+  # Bind the built-in ClusterRole "system:service-account-issuer-discovery" to
+  # pgbearer's ServiceAccount, so an identity provider of type "kubernetes" can
+  # read /.well-known/openid-configuration and /openid/v1/jwks from the API server.
+  serviceAccountIssuerDiscovery: false
+
+service:
+  type: ClusterIP
+  port: 5432
+  annotations: {}
+  # For type LoadBalancer.
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+
+admin:
+  port: 9090
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# Must exceed drain.accept_grace + drain.hard_timeout (defaults 5s + 90s).
+terminationGracePeriodSeconds: 120
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+networkPolicy:
+  enabled: false
+  # Who may connect to the PostgreSQL port (NetworkPolicyPeer list).
+  # Empty means any source.
+  clientFrom: []
+  # Who may scrape the admin port.
+  metricsFrom: []
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+prometheusRule:
+  enabled: false
+  labels: {}

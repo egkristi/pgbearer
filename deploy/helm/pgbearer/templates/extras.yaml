@@ -1,0 +1,164 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "pgbearer.serviceAccountName" . }}
+  labels:
+    {{- include "pgbearer.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+{{- end }}
+{{- if .Values.rbac.serviceAccountIssuerDiscovery }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "pgbearer.fullname" . }}-{{ .Release.Namespace }}-issuer-discovery
+  labels:
+    {{- include "pgbearer.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:service-account-issuer-discovery
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pgbearer.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pgbearer.fullname" . }}
+  labels:
+    {{- include "pgbearer.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pgbearer.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if .Values.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "pgbearer.fullname" . }}
+  labels:
+    {{- include "pgbearer.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "pgbearer.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      # Scaling down disconnects session-mode clients; be conservative.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pgbearer.fullname" . }}
+  labels:
+    {{- include "pgbearer.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pgbearer.selectorLabels" . | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: postgres
+          protocol: TCP
+      {{- with .Values.networkPolicy.clientFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    - ports:
+        - port: admin
+          protocol: TCP
+      {{- with .Values.networkPolicy.metricsFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- if .Values.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "pgbearer.fullname" . }}
+  labels:
+    {{- include "pgbearer.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "pgbearer.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}
+{{- if .Values.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "pgbearer.fullname" . }}
+  labels:
+    {{- include "pgbearer.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: pgbearer
+      rules:
+        - alert: PgbearerJwksStale
+          expr: max by (provider) (pgbearer_jwks_age_seconds) > 7200
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "JWKS for {{`{{ $labels.provider }}`}} has not been refreshed for over 2 hours"
+        - alert: PgbearerCertificateExpiringSoon
+          expr: (min by (cert) (pgbearer_tls_cert_expiry_timestamp_seconds) - time()) < 7 * 24 * 3600
+          for: 1h
+          labels: { severity: warning }
+          annotations:
+            summary: "Certificate {{`{{ $labels.cert }}`}} expires within 7 days"
+        - alert: PgbearerPoolAcquireTimeouts
+          expr: sum by (backend) (rate(pgbearer_pool_acquire_timeouts_total[5m])) > 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Clients are timing out waiting for backend connections to {{`{{ $labels.backend }}`}}"
+        - alert: PgbearerAuthFailureSpike
+          expr: sum(rate(pgbearer_auth_attempts_total{result="failure"}[5m])) > 1
+          for: 10m
+          labels: { severity: info }
+          annotations:
+            summary: "Elevated rate of failed token authentications"
+{{- end }}

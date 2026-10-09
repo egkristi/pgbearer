@@ -25,11 +25,16 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 arc-swap = { workspace = true }
 url = { workspace = true }
+# Optional: in-process mock identity provider for tests (feature "testing").
+axum = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+
+[features]
+testing = ["dep:axum", "dep:rcgen"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-axum = { workspace = true }
-rcgen = { workspace = true }
+pgbearer-auth = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true
