@@ -153,10 +153,12 @@ review.
 - [x] Licence file: Apache-2.0 ([decision D1](#10-open-decisions)).
 - [ ] `SECURITY.md` (disclosure process), `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`,
       issue and PR templates, Renovate or Dependabot.
-- [ ] Rename the GitHub repository from `pgproxy` to `pgbearer`
-      ([decision D2](#10-open-decisions)). Claim the `pgbearer` GitHub organisation
-      and container namespaces, and publish the first real crate in Phase 1.
-      crates.io discourages placeholder crates.
+- [x] Rename the GitHub repository from `pgproxy` to
+      [`egkristi/pgbearer`](https://github.com/egkristi/pgbearer)
+      ([decision D2](#10-open-decisions)).
+- [ ] Claim the `pgbearer` GitHub organisation and container namespaces, and
+      publish the first real crate in Phase 1. crates.io discourages
+      placeholder crates.
 - [ ] Threat model v0 (`docs/threat-model.md`, STRIDE per trust boundary).
 
 **Exit criteria:** CI green on an empty workspace. `just dev-up` starts the

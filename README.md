@@ -13,7 +13,8 @@ to run in front of [CloudNativePG](https://cloudnative-pg.io) clusters.
 > repository holds the architecture and roadmap. Read
 > [ARCHITECTURE.md](ARCHITECTURE.md) and [PLAN.md](PLAN.md), and feedback is
 > welcome in issues. The project was planned under the working name
-> *pgproxy*; the repository will be renamed to *pgbearer*.
+> *pgproxy*. The repository now lives at
+> [egkristi/pgbearer](https://github.com/egkristi/pgbearer).
 
 ---
 
