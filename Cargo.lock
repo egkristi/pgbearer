@@ -1443,6 +1443,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "jsonwebtoken",
+ "pgbearer-auth",
  "pgbearer-config",
  "pgbearer-core",
  "pgbearer-telemetry",
