@@ -1382,19 +1382,52 @@ measured (F20).
 | CI | PostgreSQL 16/17/18 (+19 non-blocking); SHA-pinned actions; pinned toolchain and MSRV job; budget render check | P1 |
 | Docs | ARCHITECTURE §6.1, §7.3, §7.4, §9.1–9.3, §10.3–10.6, §11, §12, §13, §14.2, §16.3, §17, §18, §19, §20; README claims; `SECURITY.md`; runbooks (unknown outcomes, key compromise, certificate expiry, pool exhaustion, policy convergence, audit outage) | P0/P1 |
 
-### 9.3 What changed with this document
+### 9.3 What has changed so far
 
-This commit records the analysis and updates PLAN.md (gates, decisions,
-phases, ADR backlog), ARCHITECTURE.md (the corrected contracts above) and the
-README (accurate claims). Code changes follow in the implementation order of
-§9.1, starting with the small, unambiguous fixes:
+**Documents.** The analysis is recorded, and the following are updated:
 
-* N3 (claim lookup)
-* N9 (`copy_body` poisoning)
-* N35 (NUL in startup values)
-* N34 (startup packet limit)
-* N30 (GitHub tenant claim)
-* the example and Helm fixes
+* PLAN.md: gates, decisions, phases, ADR backlog;
+* ARCHITECTURE.md: the corrected contracts above;
+* the README: accurate claims;
+* the guides.
 
-After that come the policy, pool and session crates, written against the
-revised contracts.
+**Code.** The small, unambiguous fixes are implemented and tested:
+
+* **N3:** one claim lookup in `pgbearer-core` (literal name, dotted path,
+  JSON Pointer), used by both auth and policy. Claim names are validated at
+  load.
+* **N9:** `FrameReader` body methods poison the reader on cancellation or
+  failure, with a regression test reproducing the duplicated bytes.
+* **N35 and N34:** `encode_startup_message` rejects empty names, NUL bytes
+  and packets over 10 000 bytes. `limits.max_startup_packet_bytes` is capped
+  at 10 000.
+* **N30:** the GitHub preset tenant is `repository_owner_id`.
+* **N13:** transaction mode requires `experimental.transaction_pooling`.
+* **N17:** grants must name an issuer.
+* **N18 (partly):** a per-grant `session_max_lifetime` may not exceed the
+  global value.
+* **N21 (configuration):** `proxy_protocol` other than `off` requires
+  `trusted_proxies`.
+* **N31:** Kubernetes providers reject the API server's audience.
+* **D5 (partly):** the default `token_expiry_grace` is 60 s.
+* **Examples:**
+  * PROXY off;
+  * pool limits within a stated budget;
+  * GitHub immutable-ID and workflow claims, plus a deny rule for
+    pull-request events;
+  * `max_connections` and `client_connection_check_interval` in the
+    cluster;
+  * HBA database column `orders`;
+  * no `pg_read_all_data`.
+* **Helm (N5, N29):**
+  * the config is mounted as a directory (`/etc/pgbearer/config`);
+  * the restart checksum excludes hot-reloadable sections;
+  * PDB `maxUnavailable: 1`;
+  * `minReadySeconds: 100`;
+  * configurable `maxSurge`.
+* **CI:** PostgreSQL 16/17/18.
+
+**Next.** The policy, pool and session crates are written against the revised
+contracts in the order of §9.1. Configuration renames and new fields
+(`pool.reuse`, deadlines, `acknowledged_role_risks`, token profiles, …) land
+with the code that uses them.

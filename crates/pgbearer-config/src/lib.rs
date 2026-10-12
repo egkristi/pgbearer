@@ -101,6 +101,19 @@ pub struct Config {
     /// Identity propagation to PostgreSQL (GUCs, application_name).
     #[serde(default)]
     pub propagation: PropagationConfig,
+    /// Features that have not passed their release gate yet.
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
+}
+
+/// Opt-in switches for experimental features. Using an experimental feature
+/// without its switch is a validation error, never a silent fallback.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExperimentalConfig {
+    /// Allow `pool_mode: transaction` (gate G4 not yet passed; see
+    /// ARCHITECTURE §10.5).
+    pub transaction_pooling: bool,
 }
 
 impl Config {
@@ -185,6 +198,11 @@ pub struct ListenerConfig {
     /// PROXY protocol v2 handling.
     #[serde(default)]
     pub proxy_protocol: ProxyProtocolMode,
+    /// Networks of the load balancers allowed to send a PROXY header.
+    /// Required when `proxy_protocol` is not `off`; a header from any other
+    /// peer is rejected, so clients cannot forge their source address.
+    #[serde(default)]
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     /// How clients authenticate on this listener.
     #[serde(default)]
     pub client_auth: ClientAuthMethod,
@@ -235,7 +253,7 @@ pub enum ProxyProtocolMode {
     /// Never expect a PROXY header.
     #[default]
     Off,
-    /// Accept a PROXY v2 header if present.
+    /// Accept a PROXY v2 header if present (only from `trusted_proxies`).
     Optional,
     /// Require a PROXY v2 header.
     Required,
@@ -460,7 +478,8 @@ impl EffectiveClaims {
                 groups: None,
                 roles: None,
                 scopes: None,
-                tenant: Some("repository_owner".into()),
+                // The immutable numeric owner ID, not the renamable owner name.
+                tenant: Some("repository_owner_id".into()),
                 client_id: None,
             },
         }
@@ -978,7 +997,7 @@ impl Default for SessionConfig {
         SessionConfig {
             user_semantics: UserSemantics::Auto,
             on_token_expiry: TokenExpiryAction::TerminateWhenIdle,
-            token_expiry_grace: Duration::from_secs(300),
+            token_expiry_grace: Duration::from_secs(60),
             max_lifetime: Duration::from_secs(12 * 3600),
             idle_timeout: Duration::from_secs(3600),
             idle_in_transaction_timeout: Duration::from_secs(600),
@@ -995,7 +1014,8 @@ pub struct LimitsConfig {
     pub max_client_connections: u32,
     /// Maximum connections that have not finished authentication.
     pub max_pending_auth: u32,
-    /// Maximum startup packet size in bytes.
+    /// Maximum startup packet size in bytes (at most 10 000, PostgreSQL's own
+    /// limit, because the packet is forwarded to the backend).
     pub max_startup_packet_bytes: usize,
     /// Maximum password / SASL message size in bytes (tokens can be large).
     pub max_auth_message_bytes: usize,

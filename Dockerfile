@@ -27,4 +27,4 @@ COPY --from=build /out/pgbearer /out/pgbearerctl /usr/local/bin/
 USER nonroot:nonroot
 EXPOSE 5432 9090
 ENTRYPOINT ["/usr/local/bin/pgbearer"]
-CMD ["--config", "/etc/pgbearer/pgbearer.yaml"]
+CMD ["--config", "/etc/pgbearer/config/pgbearer.yaml"]

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     API_VERSION, BackendConfig, BackendTlsMode, ClientAuthMethod, Config, IdentityProviderConfig,
-    IdpType, KIND, LoginMethod, Predicate,
+    IdpType, KIND, LoginMethod, PoolMode, Predicate, ProxyProtocolMode,
 };
 
 /// Collect every validation problem in `config`.
@@ -82,6 +82,23 @@ impl Validator {
                      set insecure_allow_plaintext_auth: true only for local development"
                 ));
             }
+            match l.proxy_protocol {
+                ProxyProtocolMode::Off => {
+                    if !l.trusted_proxies.is_empty() {
+                        self.err(format!(
+                            "{ctx}: trusted_proxies is only used when proxy_protocol is optional or required"
+                        ));
+                    }
+                }
+                ProxyProtocolMode::Optional | ProxyProtocolMode::Required => {
+                    if l.trusted_proxies.is_empty() {
+                        self.err(format!(
+                            "{ctx}: proxy_protocol requires trusted_proxies (the load balancer networks); \
+                             otherwise any client could forge its source address"
+                        ));
+                    }
+                }
+            }
             if let Some(tls) = &l.tls
                 && tls.reload_interval.is_zero()
             {
@@ -132,6 +149,12 @@ impl Validator {
         // Backends
         for b in &c.backends {
             self.backend(b);
+            if b.pool.mode == PoolMode::Transaction && !c.experimental.transaction_pooling {
+                self.err(format!(
+                    "backends[{}]: pool.mode: transaction is experimental; set experimental.transaction_pooling: true to use it",
+                    b.name
+                ));
+            }
         }
 
         // Routes
@@ -164,7 +187,26 @@ impl Validator {
         for g in &c.policies {
             let ctx = format!("policies[{}]", g.name);
             self.predicate(&ctx, &g.when, &idp_names, &listener_names);
+            if g.when.issuer.is_none() {
+                self.err(format!(
+                    "{ctx}: when.issuer is required on grants (subjects and role names are only unique per issuer)"
+                ));
+            }
             let grant = &g.grant;
+            if grant.pool_mode == Some(PoolMode::Transaction) && !c.experimental.transaction_pooling
+            {
+                self.err(format!(
+                    "{ctx}: pool_mode: transaction is experimental; set experimental.transaction_pooling: true to use it"
+                ));
+            }
+            if grant
+                .session_max_lifetime
+                .is_some_and(|d| d > c.session.max_lifetime)
+            {
+                self.err(format!(
+                    "{ctx}: session_max_lifetime may only shorten session.max_lifetime"
+                ));
+            }
             match c.backend(&grant.backend) {
                 None => self.err(format!("{ctx}: unknown backend {:?}", grant.backend)),
                 Some(b) => {
@@ -229,8 +271,11 @@ impl Validator {
             self.err("session.max_lifetime must be greater than zero");
         }
         let l = &c.limits;
-        if !(1024..=65_536).contains(&l.max_startup_packet_bytes) {
-            self.err("limits.max_startup_packet_bytes must be between 1024 and 65536");
+        if !(1024..=10_000).contains(&l.max_startup_packet_bytes) {
+            self.err(
+                "limits.max_startup_packet_bytes must be between 1024 and 10000 \
+                 (PostgreSQL's limit; the packet is forwarded to the backend)",
+            );
         }
         if !(1024..=1_048_576).contains(&l.max_auth_message_bytes) {
             self.err("limits.max_auth_message_bytes must be between 1024 and 1048576");
@@ -265,6 +310,24 @@ impl Validator {
         }
         if p.algorithms.is_empty() {
             self.err(format!("{ctx}: algorithms must not be empty"));
+        }
+        if p.kind == IdpType::Kubernetes {
+            // The API server's own audience is carried by every pod's
+            // automounted token, whose lifetime can be extended to about a year.
+            let issuer = p.effective_issuer().unwrap_or_default();
+            for a in &p.audiences {
+                let a = a.trim();
+                if a == issuer.trim_end_matches('/')
+                    || a == issuer
+                    || a.starts_with("https://kubernetes.default.svc")
+                    || a == "kubernetes.default.svc"
+                {
+                    self.err(format!(
+                        "{ctx}: audience {a:?} is the API server's own audience; use a dedicated \
+                         audience (for example \"pgbearer\") with a projected ServiceAccount token"
+                    ));
+                }
+            }
         }
         if p.kind == IdpType::Entra {
             if p.tenants.is_empty() {
@@ -421,6 +484,8 @@ impl Validator {
         for c in &p.claims {
             if c.name.trim().is_empty() {
                 self.err(format!("{ctx}: when.claims entries need a name"));
+            } else if let Err(e) = pgbearer_core::validate_claim_name(&c.name) {
+                self.err(format!("{ctx}: when.claims: {e}"));
             }
             if c.equals.is_none()
                 && c.contains.is_none()

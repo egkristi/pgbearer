@@ -84,16 +84,103 @@ impl Identity {
         }
     }
 
-    /// Look up a claim by a dotted path, for example `realm_access.roles`.
-    pub fn claim(&self, path: &str) -> Option<&serde_json::Value> {
-        let mut parts = path.split('.');
-        let first = parts.next()?;
-        let mut current = self.claims.get(first)?;
-        for part in parts {
-            current = current.as_object()?.get(part)?;
-        }
-        Some(current)
+    /// Look up a claim by name; see [`lookup_claim`] for the name syntax.
+    pub fn claim(&self, name: &str) -> Option<&serde_json::Value> {
+        lookup_claim(&self.claims, name)
     }
+}
+
+/// Look up a claim in a verified claim set. This is the one lookup used by
+/// token validation (claim mapping) and by policy, so both always agree on
+/// what a claim name means.
+///
+/// * A name starting with `/` is an RFC 6901 JSON Pointer, for example
+///   `/kubernetes.io/serviceaccount/uid` (`~1` stands for `/`, `~0` for `~`;
+///   array elements are addressed by index).
+/// * Otherwise a claim whose literal name matches wins, so namespaced claims
+///   such as `https://example.com/roles` or `kubernetes.io` work.
+/// * Otherwise a dotted name is a path into nested objects, for example
+///   `realm_access.roles`.
+pub fn lookup_claim<'a>(
+    claims: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(pointer) = name.strip_prefix('/') {
+        let mut tokens = pointer.split('/');
+        let mut current = claims.get(&unescape_pointer_token(tokens.next()?)?)?;
+        for token in tokens {
+            let token = unescape_pointer_token(token)?;
+            current = match current {
+                serde_json::Value::Object(map) => map.get(&token)?,
+                serde_json::Value::Array(items) => items.get(parse_array_index(&token)?)?,
+                _ => return None,
+            };
+        }
+        return Some(current);
+    }
+    if let Some(value) = claims.get(name) {
+        return Some(value);
+    }
+    if !name.contains('.') {
+        return None;
+    }
+    let mut parts = name.split('.');
+    let mut current = claims.get(parts.next()?)?;
+    for part in parts {
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
+}
+
+/// Check that a claim name is usable with [`lookup_claim`]: non-empty, and a
+/// well-formed JSON Pointer if it starts with `/`.
+pub fn validate_claim_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("claim name must not be empty".into());
+    }
+    if let Some(pointer) = name.strip_prefix('/') {
+        for token in pointer.split('/') {
+            if unescape_pointer_token(token).is_none() {
+                return Err(format!(
+                    "claim name {name:?} is not a valid JSON Pointer: '~' must be followed by '0' or '1'"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Undo RFC 6901 escaping (`~1` → `/`, then `~0` → `~`). `None` for an
+/// invalid escape.
+fn unescape_pointer_token(token: &str) -> Option<String> {
+    if !token.contains('~') {
+        return Some(token.to_owned());
+    }
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c == '~' {
+            match chars.next() {
+                Some('0') => out.push('~'),
+                Some('1') => out.push('/'),
+                _ => return None,
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// An RFC 6901 array index: `0` or digits without a leading zero.
+fn parse_array_index(token: &str) -> Option<usize> {
+    if token.is_empty()
+        || !token.bytes().all(|b| b.is_ascii_digit())
+        || (token.len() > 1 && token.starts_with('0'))
+    {
+        return None;
+    }
+    token.parse().ok()
 }
 
 /// Backend pooling mode.
@@ -279,6 +366,61 @@ mod tests {
         );
         assert_eq!(id.claim("realm_access.missing"), None);
         assert_eq!(id.claim("acct.deeper"), None);
+    }
+
+    #[test]
+    fn claim_lookup_prefers_literal_names_with_dots() {
+        let id = identity_with_claims(serde_json::json!({
+            "https://example.com/roles": ["admin"],
+            "kubernetes.io": {
+                "namespace": "orders",
+                "serviceaccount": {"name": "api", "uid": "u-1"}
+            },
+            "a.b": "literal",
+            "a": {"b": "nested"}
+        }));
+        assert_eq!(
+            id.claim("https://example.com/roles"),
+            Some(&serde_json::json!(["admin"]))
+        );
+        // A literal key with a dot wins over the nested path.
+        assert_eq!(id.claim("a.b"), Some(&serde_json::json!("literal")));
+        // Nested keys under a dotted top-level name need a JSON Pointer.
+        assert_eq!(id.claim("kubernetes.io.namespace"), None);
+        assert_eq!(
+            id.claim("/kubernetes.io/namespace"),
+            Some(&serde_json::json!("orders"))
+        );
+        assert_eq!(
+            id.claim("/kubernetes.io/serviceaccount/uid"),
+            Some(&serde_json::json!("u-1"))
+        );
+        assert_eq!(id.claim("/a/b"), Some(&serde_json::json!("nested")));
+    }
+
+    #[test]
+    fn claim_lookup_json_pointer_escapes_and_arrays() {
+        let id = identity_with_claims(serde_json::json!({
+            "x/y": {"m~n": 1},
+            "list": [{"v": "first"}, {"v": "second"}]
+        }));
+        assert_eq!(id.claim("/x~1y/m~0n"), Some(&serde_json::json!(1)));
+        assert_eq!(id.claim("/list/1/v"), Some(&serde_json::json!("second")));
+        assert_eq!(id.claim("/list/01/v"), None);
+        assert_eq!(id.claim("/list/9"), None);
+        assert_eq!(id.claim("/x~2y"), None);
+        assert_eq!(id.claim("/missing"), None);
+    }
+
+    #[test]
+    fn claim_names_are_validated() {
+        assert!(validate_claim_name("acct").is_ok());
+        assert!(validate_claim_name("https://example.com/roles").is_ok());
+        assert!(validate_claim_name("/kubernetes.io/serviceaccount/uid").is_ok());
+        assert!(validate_claim_name("/a~1b~0c").is_ok());
+        assert!(validate_claim_name("").is_err());
+        assert!(validate_claim_name("/a~2").is_err());
+        assert!(validate_claim_name("/a~").is_err());
     }
 
     #[test]

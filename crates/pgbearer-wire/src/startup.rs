@@ -273,26 +273,45 @@ fn parse_params(payload: &[u8]) -> Result<Vec<(String, String)>, WireError> {
 
 /// Encode a `StartupMessage` (used for backend connections).
 ///
-/// Names and values are written as C strings: anything from an interior NUL
-/// onward is dropped. Pairs with an empty name are skipped, because an empty
-/// name is the list terminator.
+/// Fails with [`WireError::Protocol`] if a name is empty (an empty name is the
+/// list terminator) or a name or value contains NUL, because a C string would
+/// silently cut it short; and with [`WireError::InvalidLength`] if the packet
+/// would exceed [`DEFAULT_MAX_STARTUP_PACKET_LEN`], PostgreSQL's own limit.
+/// On error `buf` is left as it was.
 pub fn encode_startup_message(
     buf: &mut BytesMut,
     version: ProtocolVersion,
     params: &[(&str, &str)],
-) {
+) -> Result<(), WireError> {
+    for (name, value) in params {
+        if name.is_empty() {
+            return Err(WireError::protocol("startup parameter name is empty"));
+        }
+        if name.contains('\0') || value.contains('\0') {
+            return Err(WireError::protocol(format!(
+                "startup parameter {:?} contains a NUL byte",
+                name.replace('\0', "\\0")
+            )));
+        }
+    }
+    let start = buf.len();
     let len_pos = begin_length(buf);
     buf.put_i32(version.code());
     for (name, value) in params {
-        // An empty name would be read as the list terminator.
-        if name.is_empty() || name.starts_with('\0') {
-            continue;
-        }
         put_cstr(buf, name);
         put_cstr(buf, value);
     }
     buf.put_u8(0);
+    let len = buf.len() - start;
+    if len > DEFAULT_MAX_STARTUP_PACKET_LEN {
+        buf.truncate(start);
+        return Err(WireError::InvalidLength {
+            len: i64::try_from(len).unwrap_or(i64::MAX),
+            limit: DEFAULT_MAX_STARTUP_PACKET_LEN,
+        });
+    }
     finish_message(buf, len_pos);
+    Ok(())
 }
 
 /// Encode an `SSLRequest`.
@@ -334,7 +353,7 @@ mod tests {
 
     fn startup_bytes(version: ProtocolVersion, params: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = BytesMut::new();
-        encode_startup_message(&mut buf, version, params);
+        encode_startup_message(&mut buf, version, params).unwrap();
         buf.to_vec()
     }
 
@@ -580,8 +599,12 @@ mod tests {
         let m = expect_startup(read(&bytes).await.unwrap());
         assert_eq!(m.get("a").map(str::len), Some(filler.len()));
 
+        // The encoder refuses oversize packets, so build this one by hand.
         let filler = "x".repeat(MAX - 8 - "a\0".len() - 1);
-        let bytes = startup_bytes(ProtocolVersion::V3_0, &[("a", &filler)]);
+        let mut payload = b"a\0".to_vec();
+        payload.extend_from_slice(filler.as_bytes());
+        payload.extend_from_slice(b"\0\0");
+        let bytes = packet(196_608, &payload);
         assert_eq!(bytes.len(), MAX + 1);
         assert_invalid_length(read(&bytes).await, (MAX + 1) as i64);
 
@@ -659,14 +682,34 @@ mod tests {
     }
 
     #[test]
-    fn encode_startup_skips_empty_names_and_truncates_nul() {
-        let bytes = startup_bytes(
-            ProtocolVersion::V3_0,
-            &[("", "ignored"), ("user", "al\0ice"), ("\0x", "y")],
-        );
-        assert_eq!(bytes, packet(196_608, b"user\0al\0\0"));
-        let m = expect_startup(block_on(read(&bytes)).unwrap());
-        assert_eq!(m.user(), Some("al"));
+    fn encode_startup_rejects_empty_names_nul_and_oversize() {
+        let v = ProtocolVersion::V3_0;
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        for params in [
+            &[("", "ignored")][..],
+            &[("user", "al\0ice")][..],
+            &[("\0x", "y")][..],
+            &[("pgbearer.sub", "a\0b")][..],
+        ] {
+            assert!(matches!(
+                encode_startup_message(&mut buf, v, params),
+                Err(WireError::Protocol(_))
+            ));
+            assert_eq!(&buf[..], b"keep");
+        }
+        let big = "x".repeat(DEFAULT_MAX_STARTUP_PACKET_LEN);
+        assert!(matches!(
+            encode_startup_message(&mut buf, v, &[("options", big.as_str())]),
+            Err(WireError::InvalidLength { .. })
+        ));
+        assert_eq!(&buf[..], b"keep");
+        // Exactly at the limit is fine: 4 (length) + 4 (code) + "a\0" + value + "\0" + "\0".
+        let fits = "y".repeat(DEFAULT_MAX_STARTUP_PACKET_LEN - 4 - 4 - 2 - 1 - 1);
+        let mut out = BytesMut::new();
+        encode_startup_message(&mut out, v, &[("a", fits.as_str())]).unwrap();
+        assert_eq!(out.len(), DEFAULT_MAX_STARTUP_PACKET_LEN);
+        let m = expect_startup(block_on(read(&out)).unwrap());
+        assert_eq!(m.get("a"), Some(fits.as_str()));
     }
 
     fn param_string() -> impl Strategy<Value = String> {

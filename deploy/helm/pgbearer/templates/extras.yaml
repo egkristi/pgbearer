@@ -37,7 +37,11 @@ metadata:
   labels:
     {{- include "pgbearer.labels" . | nindent 4 }}
 spec:
+  {{- if .Values.podDisruptionBudget.minAvailable }}
   minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "pgbearer.selectorLabels" . | nindent 6 }}

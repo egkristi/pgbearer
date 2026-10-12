@@ -54,7 +54,7 @@ fn example_config_is_valid() {
     );
     assert_eq!(orders.pool.max_connections, 20);
     assert_eq!(orders.pool.acquire_timeout, Duration::from_secs(5));
-    assert_eq!(c.session.token_expiry_grace, Duration::from_secs(300));
+    assert_eq!(c.session.token_expiry_grace, Duration::from_secs(60));
     let gh = c.identity_provider("github").expect("github idp");
     assert_eq!(
         gh.effective_issuer().as_deref(),
@@ -270,4 +270,137 @@ fn cloudnativepg_example_values_config_is_valid() {
         orders.tls_server_name().as_deref(),
         Some("orders-db-rw.data.svc.cluster.local")
     );
+}
+
+#[test]
+fn proxy_protocol_requires_trusted_proxies() {
+    let yaml = minimal().replace(
+        "    insecure_allow_plaintext_auth: true\n",
+        "    insecure_allow_plaintext_auth: true\n    proxy_protocol: optional\n",
+    );
+    let p = problems(&yaml);
+    assert!(
+        p.iter().any(|m| m.contains("requires trusted_proxies")),
+        "{p:?}"
+    );
+
+    let yaml = minimal().replace(
+        "    insecure_allow_plaintext_auth: true\n",
+        "    insecure_allow_plaintext_auth: true\n    proxy_protocol: required\n    trusted_proxies: [\"10.0.0.0/8\"]\n",
+    );
+    let c = Config::from_yaml_str(&yaml).expect("trusted proxies configured");
+    assert_eq!(c.listeners[0].trusted_proxies.len(), 1);
+
+    let yaml = minimal().replace(
+        "    insecure_allow_plaintext_auth: true\n",
+        "    insecure_allow_plaintext_auth: true\n    trusted_proxies: [\"10.0.0.0/8\"]\n",
+    );
+    let p = problems(&yaml);
+    assert!(
+        p.iter().any(|m| m.contains("trusted_proxies is only used")),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn transaction_mode_requires_the_experimental_flag() {
+    let yaml = minimal().replace(
+        "      default_pg_role: app_ro\n",
+        "      default_pg_role: app_ro\n      pool_mode: transaction\n",
+    );
+    let p = problems(&yaml);
+    assert!(
+        p.iter()
+            .any(|m| m.contains("experimental.transaction_pooling")),
+        "{p:?}"
+    );
+
+    let enabled = format!("{yaml}experimental:\n  transaction_pooling: true\n");
+    Config::from_yaml_str(&enabled).expect("transaction mode with the flag");
+
+    let backend_mode = minimal().replace(
+        "    tls: { mode: disable }\n",
+        "    tls: { mode: disable }\n    pool: { mode: transaction }\n",
+    );
+    let p = problems(&backend_mode);
+    assert!(
+        p.iter()
+            .any(|m| m.contains("pool.mode: transaction is experimental")),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn grants_need_an_issuer_and_may_only_shorten_lifetimes() {
+    let yaml = minimal().replace(
+        "    when: { issuer: idp, groups_any: [\"readers\"] }\n",
+        "    when: { groups_any: [\"readers\"] }\n",
+    );
+    let p = problems(&yaml);
+    assert!(
+        p.iter()
+            .any(|m| m.contains("when.issuer is required on grants")),
+        "{p:?}"
+    );
+
+    let yaml = minimal().replace(
+        "      default_pg_role: app_ro\n",
+        "      default_pg_role: app_ro\n      session_max_lifetime: 13h\n",
+    );
+    let p = problems(&yaml);
+    assert!(p.iter().any(|m| m.contains("may only shorten")), "{p:?}");
+
+    // Deny rules may omit the issuer (that only widens them).
+    let yaml = format!(
+        "{}deny:\n  - name: no-bob\n    when: {{ subject: bob }}\n",
+        minimal()
+    );
+    Config::from_yaml_str(&yaml).expect("deny without issuer");
+}
+
+#[test]
+fn startup_packet_limit_is_capped_at_postgresql_limit() {
+    let yaml = format!("{}limits:\n  max_startup_packet_bytes: 20000\n", minimal());
+    let p = problems(&yaml);
+    assert!(
+        p.iter().any(|m| m.contains("between 1024 and 10000")),
+        "{p:?}"
+    );
+    let yaml = format!("{}limits:\n  max_startup_packet_bytes: 10000\n", minimal());
+    Config::from_yaml_str(&yaml).expect("10000 is allowed");
+}
+
+#[test]
+fn kubernetes_providers_reject_the_api_server_audience() {
+    let yaml = minimal().replace(
+        "  - name: idp\n    issuer: \"https://idp.example.com/realms/main\"\n    audiences: [\"pgbearer\"]\n",
+        "  - name: idp\n    issuer: \"https://idp.example.com/realms/main\"\n    audiences: [\"pgbearer\"]\n  - name: k8s\n    type: kubernetes\n    audiences: [\"https://kubernetes.default.svc.cluster.local\"]\n",
+    );
+    let p = problems(&yaml);
+    assert!(
+        p.iter().any(|m| m.contains("API server's own audience")),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn claim_names_are_checked_and_github_tenant_is_immutable() {
+    let yaml = minimal().replace(
+        "    when: { issuer: idp, groups_any: [\"readers\"] }\n",
+        "    when: { issuer: idp, claims: [{ name: \"/bad~2\", exists: true }] }\n",
+    );
+    let p = problems(&yaml);
+    assert!(
+        p.iter().any(|m| m.contains("not a valid JSON Pointer")),
+        "{p:?}"
+    );
+
+    let yaml = minimal().replace(
+        "    when: { issuer: idp, groups_any: [\"readers\"] }\n",
+        "    when: { issuer: idp, claims: [{ name: \"/kubernetes.io/serviceaccount/uid\", equals: \"u-1\" }] }\n",
+    );
+    Config::from_yaml_str(&yaml).expect("JSON Pointer claim name");
+
+    let gh = EffectiveClaims::defaults_for(IdpType::GithubActions);
+    assert_eq!(gh.tenant.as_deref(), Some("repository_owner_id"));
 }

@@ -33,10 +33,20 @@ config:
   routes: []
   policies: []
 
-# Restart pods when the configuration changes. Policy, routes and session
-# settings can be hot-reloaded, but listeners, identity providers and
-# backends need a restart, so rolling on change is the safe default.
+# The ConfigMap is mounted as a directory (/etc/pgbearer/config), so changes
+# reach running pods (after the kubelet's sync delay) and pgbearer hot-reloads
+# policies, deny rules, routes and session settings. Listeners, identity
+# providers and backends need a restart: with rollOnConfigChange, only changes
+# to those sections roll the pods.
 rollOnConfigChange: true
+
+# Rolling updates: pods are added one at a time and each new pod must stay
+# ready for minReadySeconds before the next old pod is terminated. Keep
+# minReadySeconds >= drain.accept_grace + drain.hard_timeout (5s + 90s by
+# default) so that few pods drain at once; this bounds the backend
+# connections held during a rollout (ARCHITECTURE §10.3).
+maxSurge: 1
+minReadySeconds: 100
 
 # Secret with the listener certificate (keys tls.crt and tls.key), for example
 # issued by cert-manager. Mounted at /etc/pgbearer/tls.
@@ -104,7 +114,10 @@ terminationGracePeriodSeconds: 120
 
 podDisruptionBudget:
   enabled: true
-  minAvailable: 1
+  # At most one pod is evicted at a time (node drains, cluster upgrades).
+  # Setting minAvailable instead allows mass evictions and is not recommended.
+  maxUnavailable: 1
+  minAvailable: null
 
 autoscaling:
   enabled: false

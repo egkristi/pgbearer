@@ -15,7 +15,10 @@ listeners:
       key_file: /etc/pgbearer/tls/tls.key
       min_version: "1.2"
       direct_tls: true
-    proxy_protocol: optional
+    # PROXY protocol is off. To enable it behind a load balancer, set
+    # proxy_protocol: required and list the load balancer networks in
+    # trusted_proxies; headers from any other peer are rejected.
+    proxy_protocol: "off"
     client_auth: token_password
 
 identity_providers:
@@ -48,7 +51,11 @@ backends:
       cert_file: /etc/pgbearer/backends/orders/client/tls.crt
       key_file: /etc/pgbearer/backends/orders/client/tls.key
     pool:
-      max_backend_connections: 80
+      # Per replica. Budget (ARCHITECTURE §10.3): the cluster sets
+      # max_connections 200; minus 3 superuser-reserved, ~5 CNPG-internal and
+      # a margin of 12 leaves 180 usable. With 2 replicas, maxSurge 1 and up to
+      # 2 pods draining, 5 pods x 30 = 150 <= 180.
+      max_backend_connections: 30
       max_connections: 20
       acquire_timeout: 5s
 
@@ -83,7 +90,17 @@ policies:
   - name: orders-migrations
     when:
       issuer: github
+      # The subject names the repository and environment by (renamable) name;
+      # the claims pin the immutable repository ID, the branch and the exact
+      # workflow file. Protect the environment and the workflow in GitHub too.
       subject: "repo:acme/orders:environment:production"
+      claims:
+        - name: repository_id
+          equals: "123456789"
+        - name: ref
+          equals: "refs/heads/main"
+        - name: job_workflow_ref
+          equals: "acme/orders/.github/workflows/migrate.yml@refs/heads/main"
     grant:
       backend: orders
       databases: ["orders"]
@@ -92,16 +109,24 @@ policies:
       session_max_lifetime: 30m
 
 deny:
+  # Requires the optional claim "acct" in the Entra app registration; a token
+  # without it does not match this rule.
   - name: no-guests
     when:
       issuer: entra
       claims:
         - name: acct
           equals: 1
+  - name: no-pull-request-workflows
+    when:
+      issuer: github
+      claims:
+        - name: event_name
+          any_of: ["pull_request", "pull_request_target"]
 
 session:
   on_token_expiry: terminate_when_idle
-  token_expiry_grace: 5m
+  token_expiry_grace: 60s
   max_lifetime: 12h
 
 audit:

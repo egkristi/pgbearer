@@ -55,22 +55,11 @@ impl ClaimRules {
     }
 }
 
-/// Look up a claim by name. A claim whose literal name matches wins (so
-/// namespaced claims such as `https://example.com/roles` work); otherwise a
-/// dotted name is treated as a path into nested objects.
+/// Look up a claim by name with the shared rules of
+/// [`pgbearer_core::lookup_claim`] (literal name, then dotted path; a leading
+/// `/` makes it a JSON Pointer), so claim mapping and policy always agree.
 pub(crate) fn lookup<'a>(claims: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
-    if let Some(v) = claims.get(path) {
-        return Some(v);
-    }
-    if !path.contains('.') {
-        return None;
-    }
-    let mut parts = path.split('.');
-    let mut current = claims.get(parts.next()?)?;
-    for part in parts {
-        current = current.as_object()?.get(part)?;
-    }
-    Some(current)
+    pgbearer_core::lookup_claim(claims, path)
 }
 
 /// A claim as a non-empty string (numbers are converted to strings).
@@ -446,14 +435,15 @@ mod tests {
             &rules(IdpType::GithubActions),
             obj(
                 json!({"sub": "repo:org/r:environment:prod", "repository": "org/r",
-                        "repository_owner": "org", "exp": 1}),
+                        "repository_owner": "org", "repository_owner_id": "4242", "exp": 1}),
             ),
             true,
         )
         .unwrap();
         assert_eq!(g.kind, IdentityKind::Workload);
         assert_eq!(g.username.as_deref(), Some("org/r"));
-        assert_eq!(g.tenant.as_deref(), Some("org"));
+        // The tenant is the immutable owner ID, not the renamable owner name.
+        assert_eq!(g.tenant.as_deref(), Some("4242"));
         assert!(g.scopes.is_empty());
     }
 
@@ -562,16 +552,25 @@ mod tests {
     }
 
     #[test]
-    fn github_tenant_uses_repository_owner() {
+    fn github_tenant_uses_repository_owner_id() {
         let mut r = rules(IdpType::GithubActions);
-        r.tenants = vec!["my-org".into()];
+        r.tenants = vec!["4242".into()];
         assert_eq!(
-            check_constraints(&r, None, &obj(json!({"repository_owner": "my-org"}))),
+            check_constraints(
+                &r,
+                None,
+                &obj(json!({"repository_owner": "my-org", "repository_owner_id": "4242"}))
+            ),
             Ok(())
         );
+        // A renamed or re-registered owner name does not help.
         assert_eq!(
-            check_constraints(&r, None, &obj(json!({"repository_owner": "evil"}))),
-            Err(AuthError::TenantNotAllowed("evil".into()))
+            check_constraints(
+                &r,
+                None,
+                &obj(json!({"repository_owner": "4242", "repository_owner_id": "666"}))
+            ),
+            Err(AuthError::TenantNotAllowed("666".into()))
         );
     }
 

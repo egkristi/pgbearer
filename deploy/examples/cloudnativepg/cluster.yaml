@@ -105,13 +105,21 @@ spec:
         matchLabels:
           app.kubernetes.io/name: pgbearer
   postgresql:
+    parameters:
+      # Size together with pgbearer's per-replica pool limits (values.yaml).
+      max_connections: "200"
+      # Stop backend work promptly when pgbearer closes a session (revocation,
+      # expiry, drain) or disappears.
+      client_connection_check_interval: "10s"
     pg_ident:
       # The certificate with CN "pgbearer" may log in as any role that is a
       # (direct or indirect) member of pgbearer_login (PostgreSQL 16+).
       - "pgbearer pgbearer +pgbearer_login"
     pg_hba:
       # Must come before broader rules for these users (first match wins).
-      - "hostssl all +pgbearer_login ${podselector:pgbearer} cert map=pgbearer"
+      # The database column is restricted, so a stolen gateway certificate
+      # cannot reach other databases in the cluster.
+      - "hostssl orders +pgbearer_login ${podselector:pgbearer} cert map=pgbearer"
       # Anyone else trying to use a pgbearer-reachable role is rejected.
       - "hostssl all +pgbearer_login all reject"
 ---
@@ -136,7 +144,14 @@ spec:
   cluster: { name: orders-db }
   name: orders_readonly
   login: true
-  inRoles: [pgbearer_login, pg_read_all_data]
+  # Table privileges come from the schema owner's migrations, for example:
+  #   GRANT USAGE ON SCHEMA orders TO orders_readonly;
+  #   GRANT SELECT ON ALL TABLES IN SCHEMA orders TO orders_readonly;
+  #   ALTER DEFAULT PRIVILEGES FOR ROLE orders_owner IN SCHEMA orders
+  #     GRANT SELECT ON TABLES TO orders_readonly;
+  # Avoid pg_read_all_data: it reads every table in every database the role
+  # can connect to.
+  inRoles: [pgbearer_login]
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: DatabaseRole
@@ -159,4 +174,6 @@ spec:
   cluster: { name: orders-db }
   name: orders_owner
   login: true
+  # orders_owner owns the "orders" database (bootstrap.initdb.owner). Grants
+  # for it must acknowledge the database_owner role risk.
   inRoles: [pgbearer_login]

@@ -104,8 +104,12 @@ impl Message {
 /// Cancel safety: [`next_header`](Self::next_header) is cancel safe (a
 /// partially received header stays buffered and is picked up by the next
 /// call), so it can be used as a `tokio::select!` branch. The body methods
-/// are not: if one of them is cancelled, part of the body may have been
-/// consumed, and the reader then reports a protocol error on further use.
+/// are not: if one of them is cancelled or fails, part of the body may have
+/// been consumed (and, for [`copy_body`](Self::copy_body), part of it
+/// written), so the reader is **poisoned** and every further call fails with
+/// [`WireError::Protocol`] ([`is_poisoned`](Self::is_poisoned)). The
+/// destination of a cancelled `copy_body` is no longer framed either; the
+/// connection must be closed on both sides, never reused.
 #[derive(Debug)]
 pub struct FrameReader<R> {
     inner: R,
@@ -115,6 +119,9 @@ pub struct FrameReader<R> {
     /// Body bytes of the current message not yet consumed; `None` when the
     /// reader is at a message boundary.
     pending_body: Option<usize>,
+    /// Set on entry to a body method and cleared when it succeeds, so a
+    /// cancelled or failed body operation can never be retried.
+    poisoned: bool,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -130,6 +137,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             buf,
             capacity: DEFAULT_BUFFER_CAPACITY,
             pending_body: None,
+            poisoned: false,
         }
     }
 
@@ -143,6 +151,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             buf: BytesMut::with_capacity(capacity),
             capacity,
             pending_body: None,
+            poisoned: false,
         }
     }
 
@@ -157,6 +166,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// Fails with [`WireError::Protocol`] if the body of the previous message
     /// has not been consumed.
     pub async fn next_header(&mut self) -> Result<Option<Header>, WireError> {
+        self.check_poisoned()?;
         if let Some(left) = self.pending_body {
             return Err(WireError::protocol(format!(
                 "frame reader: {left} body bytes of the previous message were not consumed"
@@ -195,6 +205,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// [`skip_body`](Self::skip_body). The returned bytes never share memory
     /// with the reader's buffer, so keeping them does not pin that buffer.
     pub async fn read_body(&mut self, header: &Header, limit: usize) -> Result<Bytes, WireError> {
+        self.check_poisoned()?;
         self.check_pending(header)?;
         let n = header.body_len;
         if n > limit {
@@ -203,6 +214,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 limit,
             });
         }
+        self.poisoned = true;
         if n <= self.capacity {
             while self.buf.len() < n {
                 if self.fill().await? == 0 {
@@ -212,6 +224,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             let body = Bytes::copy_from_slice(&self.buf[..n]);
             self.buf.advance(n);
             self.pending_body = None;
+            self.poisoned = false;
             return Ok(body);
         }
 
@@ -233,6 +246,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             }
         }
         self.pending_body = None;
+        self.poisoned = false;
         Ok(body.freeze())
     }
 
@@ -246,7 +260,11 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         header: &Header,
         writer: &mut W,
     ) -> Result<u64, WireError> {
+        self.check_poisoned()?;
         self.check_pending(header)?;
+        // A cancelled `write_all` may have written part of a chunk that is
+        // still in the buffer; a retry would write those bytes twice.
+        self.poisoned = true;
         let mut remaining = header.body_len;
         while remaining > 0 {
             // Exact at every await point (see `read_body`).
@@ -260,6 +278,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             remaining -= n;
         }
         self.pending_body = None;
+        self.poisoned = false;
         Ok(header.body_len as u64)
     }
 
@@ -267,7 +286,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     ///
     /// Never allocates more than the read buffer, whatever the body size.
     pub async fn skip_body(&mut self, header: &Header) -> Result<(), WireError> {
+        self.check_poisoned()?;
         self.check_pending(header)?;
+        self.poisoned = true;
         let mut remaining = header.body_len;
         while remaining > 0 {
             self.pending_body = Some(remaining);
@@ -279,6 +300,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             remaining -= n;
         }
         self.pending_body = None;
+        self.poisoned = false;
         Ok(())
     }
 
@@ -304,6 +326,22 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 
     /// Check that `header` describes the body that is due next.
+    /// True after a body method was cancelled or failed: the stream is no
+    /// longer framed and every further call fails.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    fn check_poisoned(&self) -> Result<(), WireError> {
+        if self.poisoned {
+            Err(WireError::protocol(
+                "frame reader: a previous body operation was cancelled or failed; the stream is no longer framed",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn check_pending(&self, header: &Header) -> Result<(), WireError> {
         match self.pending_body {
             Some(left) if left == header.body_len => Ok(()),
@@ -721,6 +759,93 @@ mod tests {
             r.read_body(&h, 1000).await,
             Err(WireError::Protocol(_))
         ));
+    }
+
+    /// A writer that accepts `accept` bytes, then stays pending forever.
+    struct StallingWriter {
+        written: Vec<u8>,
+        accept: usize,
+    }
+
+    impl AsyncWrite for StallingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let room = self.accept.saturating_sub(self.written.len());
+            if room == 0 {
+                return std::task::Poll::Pending;
+            }
+            let n = room.min(buf.len());
+            self.written.extend_from_slice(&buf[..n]);
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_copy_body_poisons_the_reader() {
+        // Regression: a copy_body cancelled during a partial write used to
+        // accept a retry and write the partial chunk twice ("012" + "0123456789").
+        let mut bytes = raw_header(b'd', 4 + 10);
+        bytes.extend_from_slice(b"0123456789");
+        let mut r = FrameReader::new(&bytes[..]);
+        let h = r.next_header().await.unwrap().unwrap();
+        let mut w = StallingWriter {
+            written: Vec::new(),
+            accept: 3,
+        };
+        tokio::select! {
+            biased;
+            res = r.copy_body(&h, &mut w) => panic!("the writer stalls, so this cannot finish: {res:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(w.written, b"012");
+        assert!(r.is_poisoned());
+        let mut retry = Vec::new();
+        assert!(matches!(
+            r.copy_body(&h, &mut retry).await,
+            Err(WireError::Protocol(_))
+        ));
+        assert!(retry.is_empty());
+        assert!(matches!(
+            r.read_body(&h, 100).await,
+            Err(WireError::Protocol(_))
+        ));
+        assert!(matches!(r.skip_body(&h).await, Err(WireError::Protocol(_))));
+        assert!(matches!(r.next_header().await, Err(WireError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn successful_body_operations_do_not_poison() {
+        let bytes = encode_all(&sample());
+        let mut r = FrameReader::with_capacity(&bytes[..], 16);
+        let h = r.next_header().await.unwrap().unwrap();
+        r.read_body(&h, 100).await.unwrap();
+        let h = r.next_header().await.unwrap().unwrap();
+        r.skip_body(&h).await.unwrap();
+        let h = r.next_header().await.unwrap().unwrap();
+        let mut out = Vec::new();
+        assert_eq!(r.copy_body(&h, &mut out).await.unwrap(), 300);
+        assert!(!r.is_poisoned());
+        // A limit error leaves the body pending and the reader usable.
+        let h = r.next_header().await.unwrap().unwrap();
+        assert_eq!(h.tag, b'X');
+        assert!(!r.is_poisoned());
     }
 
     #[tokio::test]

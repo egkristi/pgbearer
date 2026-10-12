@@ -11,16 +11,22 @@ spec:
   selector:
     matchLabels:
       {{- include "pgbearer.selectorLabels" . | nindent 6 }}
+  # Pace rollouts so that only a few pods drain (and hold backend
+  # connections) at the same time; see ARCHITECTURE §10.3.
+  minReadySeconds: {{ .Values.minReadySeconds }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 0
-      maxSurge: 1
+      maxSurge: {{ .Values.maxSurge }}
   template:
     metadata:
       annotations:
         {{- if .Values.rollOnConfigChange }}
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # Only sections that need a restart roll the pods. Policies, deny
+        # rules, routes and session settings are hot-reloaded from the
+        # directory-mounted ConfigMap.
+        checksum/config: {{ omit .Values.config "policies" "deny" "routes" "session" | toYaml | sha256sum }}
         {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -44,7 +50,7 @@ spec:
         - name: pgbearer
           image: {{ include "pgbearer.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["--config", "/etc/pgbearer/pgbearer.yaml"]
+          args: ["--config", "/etc/pgbearer/config/pgbearer.yaml"]
           env:
             - name: HOSTNAME
               valueFrom:
@@ -80,9 +86,10 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            # A directory mount (never subPath), so ConfigMap updates reach the
+            # running pod and hot reload works.
             - name: config
-              mountPath: /etc/pgbearer/pgbearer.yaml
-              subPath: pgbearer.yaml
+              mountPath: /etc/pgbearer/config
               readOnly: true
             {{- if .Values.listenerTls.secretName }}
             - name: listener-tls

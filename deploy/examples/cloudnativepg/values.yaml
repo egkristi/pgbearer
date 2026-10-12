@@ -72,6 +72,13 @@ config:
         method: cert
         cert_file: /etc/pgbearer/backends/orders/client/tls.crt
         key_file: /etc/pgbearer/backends/orders/client/tls.key
+      pool:
+        # Per replica. cluster.yaml sets max_connections 200: minus 3
+        # superuser-reserved, ~5 CNPG-internal and a margin of 12 leaves 180.
+        # The chart runs 2 replicas; with maxSurge 1 and up to 2 pods draining
+        # that is 5 pods x 30 = 150 <= 180 (ARCHITECTURE §10.3).
+        max_backend_connections: 30
+        max_connections: 20
   routes:
     - match: { databases: ["orders"] }
       backend: orders

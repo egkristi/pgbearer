@@ -199,8 +199,9 @@ review.
 - [ ] Pinned `rust-toolchain.toml`, an MSRV job, SHA-pinned actions with
       Renovate or Dependabot, minimal workflow permissions, untrusted PR jobs
       without secrets.
-- [ ] CI baseline PostgreSQL 16/17/18 (19 beta non-blocking); drop 14
+- [x] CI baseline PostgreSQL 16/17/18; drop 14
       ([decision D8](#11-decisions)).
+- [ ] Non-blocking PostgreSQL 19 beta job.
 - [ ] `SECURITY.md` (disclosure process), `CONTRIBUTING.md`, issue and PR
       templates.
 - [ ] `docs/adr/` with template; ADR-001 … ADR-004 recorded; ADR-005 and
@@ -227,8 +228,9 @@ from release builds.
 - [x] Typed views and encoders for the messages pgbearer inspects or
       generates.
 - [x] Pre-auth limits (startup ≤ 10 000 bytes, password ≤ 16 KiB).
-- [ ] Poison body methods after cancellation (audit response N9); reject
-      NUL in encoded values (N35); duplicate-key helpers (N36).
+- [x] Poison body methods after cancellation (audit response N9); reject
+      NUL and oversize packets in the startup encoder (N35, N34).
+- [ ] Duplicate-key helpers (N36).
 - [ ] Lazy, adaptive buffers that shrink when idle (N25).
 - [ ] cargo-fuzz targets for every decoder.
 
@@ -290,14 +292,18 @@ session, bounded revocation, audit evidence.
       tokens).
 - [ ] `max_token_lifetime` per provider; same-origin redirects;
       `revoked_key_ids`; `key_id` on `Identity`.
-- [ ] Kubernetes audience validation (reject the API server audience).
-- [ ] GitHub preset: tenant `repository_owner_id`.
+- [x] Kubernetes audience validation (reject the API server audience).
+- [x] GitHub preset: tenant `repository_owner_id`.
 
 **`pgbearer-core` / `pgbearer-config`**
-- [ ] One claim lookup: literal name, then dotted path, then JSON Pointer.
-- [ ] New settings from the audit response §9.2: reuse, experimental flag,
-      expiry and revocation deadlines, `acknowledged_role_risks`, trusted
-      proxies, keepalives, per-replica limit names, startup-packet cap.
+- [x] One claim lookup: literal name, then dotted path, then JSON Pointer;
+      claim names validated at load.
+- [x] Experimental flag for transaction mode; trusted proxies; issuer
+      required on grants; lifetime overrides only shorten; startup-packet
+      cap; grace 60 s.
+- [ ] Remaining settings from the audit response §9.2: reuse, expiry hard
+      timeout and revocation deadline, `acknowledged_role_risks`,
+      keepalives, per-replica limit names, token profiles.
 
 **`pgbearer-policy`**
 - [ ] Three-valued predicates; deny fires on Unknown unless
@@ -331,11 +337,12 @@ session, bounded revocation, audit evidence.
       drop metrics.
 
 **Deployment (basic)**
-- [ ] Helm: directory config mount; checksum only over restart-required
-      sections; projected token for issuer discovery; PDB `maxUnavailable: 1`;
-      `minReadySeconds`.
-- [ ] Examples within the connection budget; schema-scoped grants; HBA
-      database column; trusted-proxy config; GitHub claims.
+- [x] Helm: directory config mount; checksum only over restart-required
+      sections; PDB `maxUnavailable: 1`; `minReadySeconds`; configurable
+      `maxSurge`.
+- [ ] Helm: projected token for issuer discovery.
+- [x] Examples within the connection budget; schema-scoped grants; HBA
+      database column; PROXY off; GitHub claims.
 
 **Testing**
 - [ ] Mock-issuer tests for every validation rule (done for the existing

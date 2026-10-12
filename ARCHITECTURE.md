@@ -1126,7 +1126,7 @@ listeners:
       key_file: /etc/pgbearer/tls/tls.key
       min_version: "1.2"
       direct_tls: true                 # PG17+ sslnegotiation=direct (ALPN "postgresql")
-    proxy_protocol: off                # off | optional | required (the latter two need trusted_proxies)
+    proxy_protocol: "off"              # off | optional | required (the latter two need trusted_proxies)
     client_auth: token_password        # token_password | oauthbearer
 
 identity_providers:

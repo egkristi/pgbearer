@@ -179,6 +179,7 @@ async fn kubernetes_preset_is_workload_and_scope_exempt() {
     );
     assert_eq!(id.kind, IdentityKind::Workload);
     assert_eq!(id.claim("kubernetes.io.namespace"), None); // literal key with a dot
+    assert_eq!(id.claim("/kubernetes.io/namespace"), Some(&json!("orders")));
     assert_eq!(id.claims["kubernetes.io"]["namespace"], "orders");
 }
 
@@ -187,24 +188,25 @@ async fn github_actions_preset() {
     let idp = MockIssuer::start().await;
     let mut cfg = idp.provider_config("gha");
     cfg.kind = IdpType::GithubActions;
-    cfg.tenants = vec!["my-org".into()];
+    cfg.tenants = vec!["1001".into()];
     let s = start(&[cfg]).await;
     let token = idp.mint(json!({
         "aud": "pgbearer", "sub": "repo:my-org/app:environment:prod",
-        "repository": "my-org/app", "repository_owner": "my-org", "environment": "prod"
+        "repository": "my-org/app", "repository_owner": "my-org",
+        "repository_owner_id": "1001", "environment": "prod"
     }));
     let id = s.v.validate(&token).await.unwrap();
     assert_eq!(id.subject, "repo:my-org/app:environment:prod");
     assert_eq!(id.username.as_deref(), Some("my-org/app"));
-    assert_eq!(id.tenant.as_deref(), Some("my-org"));
+    assert_eq!(id.tenant.as_deref(), Some("1001"));
     assert_eq!(id.kind, IdentityKind::Workload);
     let other = idp.mint(json!({
         "aud": "pgbearer", "sub": "repo:evil/app:ref:refs/heads/main",
-        "repository": "evil/app", "repository_owner": "evil"
+        "repository": "evil/app", "repository_owner": "evil", "repository_owner_id": "2002"
     }));
     assert_eq!(
         s.v.validate(&other).await.unwrap_err(),
-        AuthError::TenantNotAllowed("evil".into())
+        AuthError::TenantNotAllowed("2002".into())
     );
 }
 
