@@ -35,6 +35,8 @@ testing = ["dep:axum", "dep:rcgen"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 pgbearer-auth = { path = ".", features = ["testing"] }
+proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

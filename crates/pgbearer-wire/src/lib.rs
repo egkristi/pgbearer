@@ -20,10 +20,13 @@
 //! This crate performs no policy decisions and no network I/O beyond reading
 //! and writing the streams it is given.
 
+mod codec;
 pub mod frame;
 pub mod messages;
 pub mod proxy_protocol;
 pub mod startup;
+#[cfg(test)]
+mod test_util;
 
 pub use frame::{FrameReader, Header, Message};
 pub use startup::{CancelRequest, ProtocolVersion, StartupMessage, StartupPacket};
@@ -140,4 +143,34 @@ pub mod tag {
 /// PostgreSQL 17+ `sslnegotiation=direct`).
 pub fn is_tls_handshake_byte(first_byte: u8) -> bool {
     first_byte == 0x16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_handshake_byte() {
+        assert!(is_tls_handshake_byte(0x16));
+        // The first byte of every startup packet is the high byte of its
+        // length, which is 0 for any length below 16 MiB.
+        assert!(!is_tls_handshake_byte(0x00));
+        assert!(!is_tls_handshake_byte(b'G'));
+    }
+
+    #[test]
+    fn error_messages() {
+        assert_eq!(
+            WireError::InvalidLength { len: -1, limit: 10 }.to_string(),
+            "invalid message length -1 (limit 10)"
+        );
+        assert_eq!(
+            WireError::protocol("bad").to_string(),
+            "protocol violation: bad"
+        );
+        assert_eq!(
+            WireError::UnexpectedEof.to_string(),
+            "unexpected end of stream"
+        );
+    }
 }
