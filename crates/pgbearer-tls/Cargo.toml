@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 x509-parser = "0.18"
 
 [dev-dependencies]
+proptest = { workspace = true }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
