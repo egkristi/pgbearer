@@ -9,12 +9,13 @@ to run in front of [CloudNativePG](https://cloudnative-pg.io) clusters.
 *Present a **bearer** token, get a least-privilege **PostgreSQL** role.*
 
 > [!IMPORTANT]
-> **Status: planning / pre-alpha.** There is no usable code yet. This
-> repository holds the architecture and roadmap. Read
-> [ARCHITECTURE.md](ARCHITECTURE.md) and [PLAN.md](PLAN.md), and feedback is
-> welcome in issues. The project was planned under the working name
-> *pgproxy*. The repository now lives at
-> [egkristi/pgbearer](https://github.com/egkristi/pgbearer).
+> **Status: pre-alpha, not usable yet.** The wire codec, TLS and token
+> validation are implemented and tested; the session relay, policy engine,
+> backend pool and server are being built. Features below are *planned* and
+> ship only when their evidence gates pass ([PLAN.md](PLAN.md#6-release-gates)).
+> An external design audit (9 October 2026) and our
+> [response](docs/reviews/2026-10-09-audit-response.md) shaped the current
+> plan. The project was planned under the working name *pgproxy*.
 
 ---
 
@@ -39,8 +40,14 @@ pgbearer moves database access into your identity provider:
   work as usual.
 - **Audit with real identities.** Every connection and decision is logged with
   issuer, subject, client and role, and can be joined with PostgreSQL logs.
+  (Statement-level attribution to a person needs personal roles and pgaudit.)
+- **Bounded revocation.** Removing access in policy ends active sessions
+  within a configured deadline; expired tokens end sessions within a hard
+  bound.
 - **Kubernetes-native and CNPG-aware.** Helm chart, graceful drain, hot
-  reload, failover-aware pools, and cancellation that works across replicas.
+  reload, failover-aware sessions. Cancellation across replicas is planned
+  for Phase 4; until then a cancel only works when it reaches the replica that
+  owns the session.
 
 ## How it works
 
@@ -63,7 +70,8 @@ flowchart LR
 
 ## What it will look like
 
-**People with Entra ID: token as password, works with any client:**
+**People with Entra ID: token as password, for clients that send a password
+on request:**
 
 ```bash
 export PGPASSWORD=$(az account get-access-token \
@@ -71,10 +79,16 @@ export PGPASSWORD=$(az account get-access-token \
 psql "host=orders.db.example.com dbname=orders user=orders_readonly sslmode=verify-full"
 ```
 
-**People with psql 18: native OAuth device flow, no extra tools:**
+Always verify the server certificate (`sslmode=verify-full`): the token is the
+credential. `PGPASSWORD` is visible to your other processes while the shell
+lives; `pgbearerctl psql` avoids that. Clients configured to require channel
+binding or SCRAM only will not send a token as password.
+
+**People with psql 18: native OAuth device flow, no extra tools (preview):**
 
 ```bash
 psql "host=oauth.orders.db.example.com dbname=orders user=orders_readonly \
+      sslmode=verify-full sslrootcert=system \
       oauth_issuer=https://login.microsoftonline.com/<tenant-id>/v2.0 \
       oauth_client_id=<client-id>"
 ```
@@ -96,49 +110,54 @@ policies:
 
   - name: orders-api                    # in-cluster workload, no secrets at all
     when: { issuer: k8s, subject: "system:serviceaccount:orders:orders-api" }
-    grant: { backend: orders, databases: [orders], pg_roles: [orders_app], pool_mode: transaction }
+    grant: { backend: orders, databases: [orders], pg_roles: [orders_app] }
 ```
 
 ## Planned features
 
 | Area | Highlights |
 |---|---|
-| Protocol | PostgreSQL protocol 3.0 and 3.2 (PostgreSQL 18), direct TLS with ALPN/SNI (PostgreSQL 17+), extended protocol and pipelining, COPY, LISTEN/NOTIFY, cancellation across replicas |
-| Authentication | Token as password; SASL OAUTHBEARER; issuers: OIDC, Entra ID, Kubernetes (JWKS or TokenReview), GitHub Actions; several at once |
-| Authorization | Default deny; grants and deny rules on roles, groups, scopes, tenant and subject; per-identity limits; session lifetime tied to token expiry |
-| Backend identity | Certificate + `pg_ident` (recommended), per-role certificates (CNPG `DatabaseRole`), per-role SCRAM passwords; role safety checks |
-| Pooling | Session mode (default) and transaction mode with prepared-statement support; bounded queues; failover-aware |
-| Kubernetes | Helm chart, HPA/PDB/NetworkPolicy, hot reload, SNI routing for many clusters, CNPG `Cluster` watch |
-| Observability | Prometheus metrics, OTLP traces, JSON logs, a dedicated audit event stream |
+| Protocol | PostgreSQL protocol 3.0 and 3.2 (PostgreSQL 18), direct TLS with ALPN/SNI (PostgreSQL 17+), extended protocol and pipelining, COPY, LISTEN/NOTIFY, cancellation; client startup settings preserved exactly |
+| Authentication | Token as password; SASL OAUTHBEARER (preview); issuers: OIDC, Entra ID (delegated and application token profiles), Kubernetes (JWKS, optional TokenReview), GitHub Actions; several at once |
+| Authorization | Default deny; grants and deny rules on roles, groups, scopes, tenant, subject and claims; unknown data never grants or bypasses a deny; per-replica limits; bounded revocation and token-expiry deadlines |
+| Backend identity | Certificate + `pg_ident` (recommended), per-role certificates (CNPG `DatabaseRole`), per-role SCRAM passwords; role reachability checks |
+| Connections | One backend session per client session by default; opt-in reuse; transaction mode as an experimental feature; bounded queues; failover-aware |
+| Kubernetes | Helm chart, HPA/PDB/NetworkPolicy, hot reload, SNI routing for many clusters, CNPG `Cluster` watch, cancel forwarding between replicas |
+| Observability | Prometheus metrics, OTLP traces, JSON logs, an audit event stream with lease and backend-session evidence |
 | Supply chain | Rust with no `unsafe` in pgbearer's own code, fuzzed parsers, signed multi-arch images, SBOM, SLSA provenance |
+
+Supported backends: PostgreSQL 16 and later. Tested drivers and known
+exclusions are listed in the [compatibility matrix](PLAN.md#9-compatibility-matrix).
 
 ## Roadmap
 
-| Release | Milestone |
-|---|---|
-| `v0.1.0-alpha` | Protocol core: TLS-terminating, full-duplex relay |
-| `v0.1.0` | **MVP**: OIDC authentication, policy, backend login as mapped role, audit |
-| `v0.2.0` | Pooling: limits, session and transaction mode |
-| `v0.3.0` | Beta: Kubernetes and CloudNativePG integration, Entra ID guide |
-| `v0.4.0` | OAUTHBEARER (psql 18) and `pgbearerctl` |
-| `v1.0.0` | Hardened GA: security review, performance targets, stable config API |
+| Release | Gate | Milestone |
+|---|---|---|
+| `v0.1.0-alpha` | G1 | Protocol core: TLS-terminating, full-duplex relay with explicit relay state |
+| `v0.1.0` | G2 | **Identity pilot (MVP)**: OIDC authentication, policy, backend login as the mapped role, bounded revocation, connection audit; one backend session per client |
+| `v0.2.0` | G3 | Opt-in session reuse; several replicas with cancel forwarding; CloudNativePG at scale |
+| `v0.3.0` | G4 | Experimental transaction mode; OAUTHBEARER (psql 18) preview and `pgbearerctl` |
+| `v1.0.0` | G5 | Hardened GA: independent security review, measured performance, stable config API |
 
-Details, exit criteria and risks are in [PLAN.md](PLAN.md).
+Releases ship when their gate's evidence passes, not on a date. Details, exit
+criteria and risks are in [PLAN.md](PLAN.md).
 
 ## Relationship to gprxy
 
-pgbearer is inspired by [gprxy](https://github.com/sathwick-p/gprxy) (Go),
-which demonstrated SSO tokens as PostgreSQL passwords. pgbearer is a clean-room
-reimplementation in Rust. It addresses structural issues found in a review of
-gprxy, summarised in [ARCHITECTURE.md §2](ARCHITECTURE.md#2-lessons-from-gprxy).
-Among them:
+pgbearer is inspired by [gprxy](https://github.com/sathwick-p/gprxy) (Go,
+MPL-2.0), which demonstrated SSO tokens as PostgreSQL passwords. pgbearer is
+an independent implementation in Rust: gprxy's source was reviewed (at commit
+`02777248`), but no gprxy code or fixtures were copied. It addresses
+structural issues found in that review, summarised in
+[ARCHITECTURE.md §2](ARCHITECTURE.md#2-lessons-from-gprxy). Among them:
 
 - Role mapping is enforced on the actual query connection, not only during
   authentication.
 - A full-duplex relay, so the extended protocol, pipelining and COPY work with
-  every driver.
-- Real pooling with limits and timeouts.
-- Cancellation that works behind a load balancer.
+  the tested drivers.
+- Bounded connection limits with timeouts.
+- Cancellation that does not leak backend keys and, from Phase 4, works
+  behind a load balancer.
 - TLS to the backend.
 - Token-expiry handling.
 - Multi-issuer OIDC beyond Auth0.
@@ -148,12 +167,17 @@ Among them:
 - [ARCHITECTURE.md](ARCHITECTURE.md): target architecture, protocol handling,
   authentication, policy, pooling, CNPG and Entra ID integration, security,
   failure modes.
-- [PLAN.md](PLAN.md): phased roadmap, success criteria, compatibility matrix,
-  risks, open decisions.
+- [PLAN.md](PLAN.md): phased roadmap, release gates, success criteria,
+  compatibility matrix, risks, decisions.
+- [docs/reviews/2026-10-09-audit-response.md](docs/reviews/2026-10-09-audit-response.md):
+  analysis of the external design audit and the resulting changes.
+- [docs/guides/](docs/guides/): CloudNativePG, Entra ID and local development
+  guides.
 
 ## Contributing
 
-The project is in the design phase. The most useful contributions right now:
+The project is in early implementation. The most useful contributions right
+now:
 
 - Review of the architecture: open an issue with the section reference
   (for example "§9.2 backend identity").

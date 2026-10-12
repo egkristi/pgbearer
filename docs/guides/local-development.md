@@ -21,7 +21,8 @@ tests are skipped with a message.
 
    ```sql
    CREATE ROLE app_ro LOGIN PASSWORD 'secret';
-   GRANT pg_read_all_data TO app_ro;
+   GRANT USAGE ON SCHEMA public TO app_ro;
+   GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_ro;
    ```
 
 2. Run an OIDC provider, for example Keycloak:

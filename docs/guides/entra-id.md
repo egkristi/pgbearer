@@ -19,9 +19,13 @@ In the Entra admin center, under **App registrations**, create **pgbearer**:
 4. **Enterprise application → Properties**: set *Assignment required* to
    **Yes**, then assign users and groups to the app roles. Only assigned
    principals can get tokens at all.
-5. Optional: under **Token configuration**, emit the groups claim for
-   "Groups assigned to the application" (avoids the 200-group overage), and add
-   the optional claim `acct` if you want to deny guests.
+5. Under **Token configuration**, add the optional access-token claim
+   **`idtyp`**: it is how pgbearer recognises application (workload) tokens.
+   Optionally emit the groups claim for "Groups assigned to the application"
+   (avoids the 200-group overage), and add the optional claim `acct` if you
+   want to deny guests.
+6. Use a **separate** app registration for any public client (such as
+   `pgbearer-cli`), so its ID tokens never carry the API's audience.
 
 Note the **Application (client) ID**: with v2 tokens it is the `aud` claim.
 
@@ -55,7 +59,13 @@ deny:
 pgbearer uses `oid` as the subject (immutable) and `preferred_username` only
 for display and audit. App-only tokens (`idtyp: app`) are classified as
 workloads and are exempt from `required_scopes`, because they carry app
-`roles` instead of scopes.
+`roles` instead of scopes. An app-only token without `idtyp` has no scopes and
+is rejected, so enable the optional claim before onboarding workloads.
+
+The guest deny only works when `acct` is actually emitted. Until three-valued
+policy evaluation lands (PLAN Phase 2), a token without `acct` simply does not
+match the deny rule; afterwards such a rule fires on a missing claim unless it
+sets `on_unknown: ignore`.
 
 ## 3. Connect as a person
 
@@ -96,6 +106,16 @@ needs no Entra configuration.
 ## Token lifetime
 
 Entra access tokens live 60–90 minutes. By default pgbearer closes a session
-at its next idle point after the token expires plus 5 minutes of grace
-(`session.on_token_expiry: terminate_when_idle`). Connection pools in
-applications reconnect with a fresh token.
+at its next idle point after the token expires plus 60 seconds of grace
+(`session.on_token_expiry: terminate_when_idle`), and in any case 120 seconds
+later (`token_expiry_hard_timeout`), even if the session never goes idle.
+Connection pools in applications must obtain a fresh token for every new
+physical connection (a password callback) and keep their maximum connection
+lifetime shorter than the token lifetime.
+
+Removing a user's app-role assignment in Entra does not change tokens already
+issued: pgbearer validates tokens locally, so such a change takes effect when
+the token expires (at most `max_token_lifetime`) plus the grace and hard
+timeout. For immediate offboarding add a `deny` rule for the user's `oid`;
+pgbearer then ends their sessions within `revocation.hard_timeout`
+(60 seconds by default) after the configuration reaches the pods.
