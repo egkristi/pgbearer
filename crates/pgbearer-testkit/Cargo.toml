@@ -1,0 +1,24 @@
+[package]
+name = "pgbearer-testkit"
+description = "Throwaway PostgreSQL clusters for pgbearer integration tests: initdb/pg_ctl, generated TLS PKI, role fixtures (dev-dependency only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+tokio-postgres = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true

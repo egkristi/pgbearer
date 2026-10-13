@@ -1505,15 +1505,18 @@ dependencies = [
  "pgbearer-config",
  "pgbearer-core",
  "pgbearer-telemetry",
+ "pgbearer-testkit",
  "pgbearer-tls",
  "pgbearer-wire",
  "postgres-protocol",
  "rand 0.10.3",
  "rcgen",
  "secrecy",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-postgres",
  "tokio-rustls",
  "tokio-util",
  "tracing",
@@ -1535,6 +1538,7 @@ dependencies = [
  "pgbearer-telemetry",
  "pgbearer-tls",
  "pgbearer-wire",
+ "proptest",
  "rand 0.10.3",
  "secrecy",
  "thiserror",
@@ -1551,6 +1555,19 @@ dependencies = [
  "prometheus-client",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pgbearer-testkit"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
 ]
 
 [[package]]

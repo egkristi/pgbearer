@@ -177,6 +177,11 @@ pub struct Metrics {
     pub bytes: Family<DirectionLabels, Counter>,
     /// `pgbearer_cancel_requests_total{result}` (`forwarded`, `unknown`, `no_backend`, `rate_limited`, `error`).
     pub cancel_requests: Family<ResultLabels, Counter>,
+    /// `pgbearer_cancel_endpoint_fallback_total{backend,reason}`: backend
+    /// connections whose cancel requests go to the connected address because
+    /// the discovered physical endpoint could not be used (`no_server_addr`,
+    /// `pid_mismatch`).
+    pub cancel_endpoint_fallbacks: Family<BackendReasonLabels, Counter>,
     /// `pgbearer_jwks_refresh_total{provider,result}`.
     pub jwks_refresh: Family<ProviderResultLabels, Counter>,
     /// `pgbearer_jwks_age_seconds{provider}`: age of the key set in use.
@@ -210,6 +215,7 @@ impl Metrics {
             transactions: Family::default(),
             bytes: Family::default(),
             cancel_requests: Family::default(),
+            cancel_endpoint_fallbacks: Family::default(),
             jwks_refresh: Family::default(),
             jwks_age_seconds: Family::default(),
             tls_cert_expiry: Family::default(),
@@ -283,6 +289,11 @@ impl Metrics {
             "cancel_requests",
             "Query cancel requests",
             m.cancel_requests.clone(),
+        );
+        registry.register(
+            "cancel_endpoint_fallback",
+            "Backend connections whose cancel endpoint fell back to the connected address",
+            m.cancel_endpoint_fallbacks.clone(),
         );
         registry.register(
             "jwks_refresh",

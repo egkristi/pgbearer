@@ -56,6 +56,15 @@
 //!   that arrives during copy-in is an error whose effects are hard to
 //!   predict).
 //!
+//! **Sync during copy-in.** A `Sync` forwarded while `copy_in` is set is
+//! ignored only if the backend is still in copy-in when it reads it. If the
+//! COPY ends on the backend's side first (bad data, a timeout, a cancel), the
+//! backend reads that Sync in normal mode and answers it, and the relay cannot
+//! tell the two cases apart. So once such a Sync was forwarded, the COPY's
+//! outcome decides: a backend `CommandComplete` (the COPY succeeded, so every
+//! such Sync was read during copy-in) closes the window; an `ErrorResponse`
+//! sets `uncertain`. Without a Sync during copy-in nothing changes.
+//!
 //! With these rules the count is exact for well-behaved clients. Where it
 //! cannot be exact (`mixed`: a Query or FunctionCall inside an open extended
 //! batch, which the backend may discard after an error; `uncertain`), it can
@@ -90,7 +99,10 @@
 //! [`backpressure`](RelayState::backpressure) is true and the relay stops
 //! reading from the client until responses drain.
 
-use pgbearer_wire::messages::TxStatus;
+use std::collections::VecDeque;
+
+use pgbearer_wire::messages::{TxStatus, decode};
+use pgbearer_wire::tag;
 
 /// Upper bound on outstanding `ReadyForQuery` messages before the relay
 /// applies backpressure to the client.
@@ -154,10 +166,114 @@ pub enum ReleaseVerdict {
     NotReusable(NotReusable),
 }
 
+
+/// What an outstanding `ReadyForQuery` will answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    /// A forwarded `Query`.
+    Query,
+    /// A forwarded `FunctionCall`.
+    FunctionCall,
+    /// A forwarded `Sync`.
+    Sync,
+}
+
+/// The ordered, run-length encoded queue of `ReadyForQuery` messages the
+/// backend still owes.
+#[derive(Debug, Clone, Default)]
+struct OwedQueue {
+    /// `(kind, count)` runs, oldest first. Adjacent runs never share a kind,
+    /// and no run is empty.
+    runs: VecDeque<(Owed, u32)>,
+    /// Sum of all run counts.
+    len: u32,
+}
+
+impl OwedQueue {
+    fn len(&self) -> u32 {
+        self.len
+    }
+
+    fn front(&self) -> Option<Owed> {
+        self.runs.front().map(|&(kind, _)| kind)
+    }
+
+    /// Append one entry. Returns `false` (and changes nothing) if the count
+    /// would overflow.
+    fn push(&mut self, kind: Owed) -> bool {
+        let Some(len) = self.len.checked_add(1) else {
+            return false;
+        };
+        self.len = len;
+        match self.runs.back_mut() {
+            // A run is never longer than `len`, so this cannot overflow.
+            Some((last, count)) if *last == kind => *count += 1,
+            _ => self.runs.push_back((kind, 1)),
+        }
+        true
+    }
+
+    /// Remove the front entry.
+    fn pop(&mut self) -> Option<Owed> {
+        let (kind, count) = self.runs.front_mut()?;
+        let kind = *kind;
+        *count -= 1;
+        if *count == 0 {
+            self.runs.pop_front();
+        }
+        self.len -= 1;
+        Some(kind)
+    }
+
+    /// Remove every `Sync` entry, merging the runs that become adjacent.
+    fn remove_syncs(&mut self) {
+        let mut kept: VecDeque<(Owed, u32)> = VecDeque::with_capacity(self.runs.len());
+        let mut len = 0u32;
+        for (kind, count) in self.runs.drain(..) {
+            if kind == Owed::Sync {
+                continue;
+            }
+            len += count;
+            match kept.back_mut() {
+                Some((last, total)) if *last == kind => *total += count,
+                _ => kept.push_back((kind, count)),
+            }
+        }
+        self.runs = kept;
+        self.len = len;
+    }
+}
+
 /// Relay protocol state (see the module documentation).
 #[derive(Debug, Clone)]
 pub struct RelayState {
-    _private: (),
+    /// `ReadyForQuery` messages the backend still owes.
+    owed: OwedQueue,
+    /// Status of the last `ReadyForQuery`.
+    tx_status: TxStatus,
+    /// An extended-protocol batch was started and not yet closed by `Sync`.
+    ext_open: bool,
+    /// COPY FROM STDIN is in progress.
+    copy_in: bool,
+    /// COPY TO STDOUT is in progress.
+    copy_out: bool,
+    /// A `Sync` was forwarded during the current copy-in, and the COPY's
+    /// outcome (`CommandComplete` or `ErrorResponse`) has not been seen yet.
+    sync_during_copy_in: bool,
+    /// A `Query` or `FunctionCall` was forwarded inside an open extended batch.
+    mixed: bool,
+    /// The count can no longer be trusted for another reason.
+    uncertain: bool,
+    /// A FATAL or PANIC error was forwarded.
+    fatal: bool,
+    /// A protocol violation was seen.
+    protocol_error: bool,
+    /// A cancel request was forwarded during this lease.
+    cancel_forwarded: bool,
+    /// A client frame is only partly forwarded to the backend.
+    partial_to_backend: bool,
+    /// A backend frame is only partly forwarded to the client.
+    partial_to_client: bool,
 }
 
 impl Default for RelayState {
@@ -170,13 +286,45 @@ impl RelayState {
     /// State right after attach: `ReadyForQuery 'I'` was sent to the client,
     /// nothing is in flight.
     pub fn new() -> RelayState {
-        todo!("pgbearer-session: RelayState::new")
+        RelayState {
+            owed: OwedQueue::default(),
+            tx_status: TxStatus::Idle,
+            ext_open: false,
+            copy_in: false,
+            copy_out: false,
+            sync_during_copy_in: false,
+            mixed: false,
+            uncertain: false,
+            fatal: false,
+            protocol_error: false,
+            cancel_forwarded: false,
+            partial_to_backend: false,
+            partial_to_client: false,
+        }
     }
 
     /// A client frame with this type byte was completely forwarded.
     pub fn frontend_frame(&mut self, tag: u8) {
-        let _ = tag;
-        todo!("pgbearer-session: RelayState::frontend_frame")
+        match tag {
+            tag::QUERY => self.simple_command(Owed::Query),
+            tag::FUNCTION_CALL => self.simple_command(Owed::FunctionCall),
+            tag::SYNC => {
+                if self.copy_in {
+                    // Ignored by a backend in copy-in; see "Sync during copy-in".
+                    self.sync_during_copy_in = true;
+                } else {
+                    self.push(Owed::Sync);
+                    self.ext_open = false;
+                }
+            }
+            tag::PARSE | tag::BIND | tag::DESCRIBE | tag::EXECUTE | tag::CLOSE | tag::FLUSH => {
+                self.ext_open = true;
+            }
+            tag::COPY_DONE | tag::COPY_FAIL => self.copy_in = false,
+            tag::COPY_DATA | tag::TERMINATE => {}
+            // `PASSWORD` (not valid after authentication) and unknown tags.
+            _ => self.protocol_error = true,
+        }
     }
 
     /// A backend frame was completely forwarded. `body` is required for `Z`
@@ -184,71 +332,193 @@ impl RelayState {
     /// other tags. A missing or malformed body where one is required →
     /// `protocol_error`.
     pub fn backend_frame(&mut self, tag: u8, body: Option<&[u8]>) {
-        let _ = (tag, body);
-        todo!("pgbearer-session: RelayState::backend_frame")
+        match tag {
+            tag::READY_FOR_QUERY => {
+                match body.map(decode::ready_for_query) {
+                    Some(Ok(status)) => self.tx_status = status,
+                    // The frame still answers a request: count it below,
+                    // but keep the last known status.
+                    _ => self.protocol_error = true,
+                }
+                if self.owed.pop().is_none() {
+                    self.protocol_error = true;
+                }
+            }
+            tag::COPY_IN_RESPONSE => self.copy_in_response(),
+            tag::COPY_OUT_RESPONSE => self.copy_out = true,
+            tag::COPY_BOTH_RESPONSE => self.uncertain = true,
+            tag::COPY_DONE => self.copy_out = false,
+            tag::COMMAND_COMPLETE => {
+                // Only a COPY's own CommandComplete can follow a Sync that was
+                // forwarded during its copy-in: that COPY succeeded.
+                self.sync_during_copy_in = false;
+            }
+            tag::ERROR_RESPONSE => {
+                self.copy_in = false;
+                self.copy_out = false;
+                if std::mem::take(&mut self.sync_during_copy_in) {
+                    self.uncertain = true;
+                }
+                match body.map(decode::error_fields) {
+                    Some(Ok(fields)) => {
+                        if fields.is_fatal() {
+                            self.fatal = true;
+                        }
+                    }
+                    _ => self.protocol_error = true,
+                }
+            }
+            tag::AUTHENTICATION | tag::BACKEND_KEY_DATA | tag::NEGOTIATE_PROTOCOL_VERSION => {
+                self.protocol_error = true;
+            }
+            _ => {}
+        }
     }
 
     /// Mark (or clear) a partly forwarded frame in one direction.
     pub fn set_partial(&mut self, direction: Direction, partial: bool) {
-        let _ = (direction, partial);
-        todo!("pgbearer-session: RelayState::set_partial")
+        match direction {
+            Direction::ToBackend => self.partial_to_backend = partial,
+            Direction::ToClient => self.partial_to_client = partial,
+        }
     }
 
     /// A cancel request was forwarded to the backend during this lease.
     pub fn note_cancel_forwarded(&mut self) {
-        todo!("pgbearer-session: RelayState::note_cancel_forwarded")
+        self.cancel_forwarded = true;
     }
 
     /// The relay detected a protocol problem of its own (for example an
     /// oversized message it could not inspect).
     pub fn note_protocol_error(&mut self) {
-        todo!("pgbearer-session: RelayState::note_protocol_error")
+        self.protocol_error = true;
     }
 
     /// Last `ReadyForQuery` status.
     pub fn tx_status(&self) -> TxStatus {
-        todo!("pgbearer-session: RelayState::tx_status")
+        self.tx_status
     }
 
     /// Outstanding `ReadyForQuery` count.
     pub fn expected_rfq(&self) -> u32 {
-        todo!("pgbearer-session: RelayState::expected_rfq")
+        self.owed.len()
     }
 
     /// True when the relay should stop reading from the client.
     pub fn backpressure(&self) -> bool {
-        todo!("pgbearer-session: RelayState::backpressure")
+        self.owed.len() >= MAX_EXPECTED_RFQ
     }
 
     /// See the module documentation.
     pub fn quiescent(&self) -> bool {
-        todo!("pgbearer-session: RelayState::quiescent")
+        self.blocker().is_none()
     }
 
     /// See the module documentation.
     pub fn idle_safe_point(&self, client_buffered: usize, backend_writer_flushed: bool) -> bool {
-        let _ = (client_buffered, backend_writer_flushed);
-        todo!("pgbearer-session: RelayState::idle_safe_point")
+        self.quiescent() && client_buffered == 0 && backend_writer_flushed
     }
 
     /// See the module documentation.
     pub fn verdict(&self, backend_buffered: usize) -> ReleaseVerdict {
-        let _ = backend_buffered;
-        todo!("pgbearer-session: RelayState::verdict")
+        let reason = self.blocker().or(if self.cancel_forwarded {
+            Some(NotReusable::Cancelled)
+        } else if backend_buffered > 0 {
+            Some(NotReusable::BackendBuffered)
+        } else {
+            None
+        });
+        match reason {
+            Some(reason) => ReleaseVerdict::NotReusable(reason),
+            None => ReleaseVerdict::Reusable,
+        }
     }
 
     /// See the module documentation.
     pub fn request_in_flight(&self) -> bool {
-        todo!("pgbearer-session: RelayState::request_in_flight")
+        self.owed.len() > 0
+            || self.ext_open
+            || self.copy_in
+            || self.partial_to_backend
+            || self.mixed
+            || self.uncertain
     }
 
     /// See the module documentation.
     pub fn in_transaction(&self) -> bool {
-        todo!("pgbearer-session: RelayState::in_transaction")
+        matches!(self.tx_status, TxStatus::InTransaction | TxStatus::Failed)
     }
 
     /// True once a FATAL/PANIC error was forwarded.
     pub fn fatal(&self) -> bool {
-        todo!("pgbearer-session: RelayState::fatal")
+        self.fatal
+    }
+
+    /// The first reason (in the order of [`NotReusable`]'s variants) why the
+    /// state is not quiescent, or `None` when it is.
+    fn blocker(&self) -> Option<NotReusable> {
+        if self.fatal {
+            Some(NotReusable::Fatal)
+        } else if self.protocol_error {
+            Some(NotReusable::ProtocolError)
+        } else if self.mixed || self.uncertain {
+            Some(NotReusable::Uncertain)
+        } else if self.partial_to_backend || self.partial_to_client {
+            Some(NotReusable::PartialFrame)
+        } else if self.owed.len() > 0 || self.ext_open {
+            Some(NotReusable::Busy)
+        } else if self.copy_in || self.copy_out {
+            Some(NotReusable::Copy)
+        } else if self.tx_status != TxStatus::Idle {
+            Some(NotReusable::InTransaction)
+        } else {
+            None
+        }
+    }
+
+    /// A forwarded `Query` or `FunctionCall`.
+    fn simple_command(&mut self, kind: Owed) {
+        self.push(kind);
+        if self.ext_open {
+            self.mixed = true;
+        }
+        if self.copy_in {
+            self.uncertain = true;
+        }
+    }
+
+    fn push(&mut self, kind: Owed) {
+        if !self.owed.push(kind) {
+            // Unreachable while backpressure works; an entry that cannot be
+            // counted must never let the state look idle.
+            self.protocol_error = true;
+        }
+    }
+
+    /// `CopyInResponse`: enter copy-in and drop the Syncs the backend ignores
+    /// (see "COPY FROM STDIN fix-up").
+    fn copy_in_response(&mut self) {
+        self.copy_in = true;
+        let Some(front) = self.owed.front() else {
+            self.protocol_error = true;
+            return;
+        };
+        self.owed.remove_syncs();
+        let behind = match front {
+            Owed::Sync => {
+                self.ext_open = true;
+                self.owed.len()
+            }
+            Owed::Query | Owed::FunctionCall => self.owed.len() - 1,
+        };
+        if behind > 0 {
+            self.uncertain = true;
+        }
     }
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod proptests;
