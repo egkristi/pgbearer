@@ -268,7 +268,7 @@ fn cloudnativepg_example_values_config_is_valid() {
     let orders = values.config.backend("orders").expect("orders backend");
     assert_eq!(
         orders.tls_server_name().as_deref(),
-        Some("orders-db-rw.data.svc.cluster.local")
+        Some("orders-db-rw.data.svc")
     );
 }
 
@@ -403,4 +403,36 @@ fn claim_names_are_checked_and_github_tenant_is_immutable() {
 
     let gh = EffectiveClaims::defaults_for(IdpType::GithubActions);
     assert_eq!(gh.tenant.as_deref(), Some("repository_owner_id"));
+}
+
+#[test]
+fn backend_network_defaults_and_reuse_gate() {
+    let c = Config::from_yaml_str(&minimal()).expect("minimal config");
+    let b = &c.backends[0];
+    assert_eq!(b.effective_cancel_endpoint(), CancelEndpoint::Connected);
+    assert!(b.keepalive.enabled);
+    assert_eq!(
+        b.server_keepalive.startup_parameters(),
+        vec![
+            ("tcp_keepalives_idle".to_string(), "30".to_string()),
+            ("tcp_keepalives_interval".to_string(), "10".to_string()),
+            ("tcp_keepalives_count".to_string(), "3".to_string()),
+            (
+                "client_connection_check_interval".to_string(),
+                "10000".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        c.session.token_expiry_hard_timeout,
+        Duration::from_secs(120)
+    );
+    assert_eq!(c.revocation.hard_timeout, Duration::from_secs(60));
+
+    let yaml = minimal().replace(
+        "    tls: { mode: disable }\n",
+        "    tls: { mode: disable }\n    pool: { reuse: same_role }\n",
+    );
+    let p = problems(&yaml);
+    assert!(p.iter().any(|m| m.contains("Phase 3a")), "{p:?}");
 }

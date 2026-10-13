@@ -1,10 +1,12 @@
 //! Semantic validation of a parsed [`Config`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use crate::{
     API_VERSION, BackendConfig, BackendTlsMode, ClientAuthMethod, Config, IdentityProviderConfig,
-    IdpType, KIND, LoginMethod, PoolMode, Predicate, ProxyProtocolMode,
+    IdpType, KIND, LoginMethod, PoolMode, PoolReuse, Predicate, ProxyProtocolMode, RoleRisk,
+    UnknownHandling,
 };
 
 /// Collect every validation problem in `config`.
@@ -184,6 +186,8 @@ impl Validator {
         }
 
         // Grants
+        let mut acknowledged: BTreeMap<(String, String), (String, BTreeSet<RoleRisk>)> =
+            BTreeMap::new();
         for g in &c.policies {
             let ctx = format!("policies[{}]", g.name);
             self.predicate(&ctx, &g.when, &idp_names, &listener_names);
@@ -193,6 +197,7 @@ impl Validator {
                 ));
             }
             let grant = &g.grant;
+            self.unattested(c, &ctx, &g.when, "can never match");
             if grant.pool_mode == Some(PoolMode::Transaction) && !c.experimental.transaction_pooling
             {
                 self.err(format!(
@@ -245,10 +250,27 @@ impl Validator {
                     grant.pg_roles
                 ));
             }
-            if grant.max_connections_per_identity == Some(0) {
+            if grant.max_sessions_per_identity_per_replica == Some(0) {
                 self.err(format!(
-                    "{ctx}: max_connections_per_identity must be at least 1"
+                    "{ctx}: max_sessions_per_identity_per_replica must be at least 1"
                 ));
+            }
+            let risks = grant.effective_role_risks();
+            for role in &grant.pg_roles {
+                let key = (grant.backend.clone(), role.clone());
+                match acknowledged.get(&key) {
+                    None => {
+                        acknowledged.insert(key, (g.name.clone(), risks.clone()));
+                    }
+                    Some((other, other_risks)) if *other_risks != risks => {
+                        self.err(format!(
+                            "{ctx}: acknowledged_role_risks for role {role:?} on backend {:?} differ from grant {other:?}; \
+                             grants for the same role must acknowledge the same risks",
+                            grant.backend
+                        ));
+                    }
+                    Some(_) => {}
+                }
             }
             if grant.session_max_lifetime.is_some_and(|d| d.is_zero()) {
                 self.err(format!(
@@ -261,6 +283,14 @@ impl Validator {
         for d in &c.deny {
             let ctx = format!("deny[{}]", d.name);
             self.predicate(&ctx, &d.when, &idp_names, &listener_names);
+            if d.on_unknown == UnknownHandling::Deny {
+                self.unattested(
+                    c,
+                    &ctx,
+                    &d.when,
+                    "would deny every identity from this provider (set on_unknown: ignore if that is not intended)",
+                );
+            }
         }
 
         // Session, limits, drain
@@ -269,6 +299,12 @@ impl Validator {
         }
         if c.session.max_lifetime.is_zero() {
             self.err("session.max_lifetime must be greater than zero");
+        }
+        if c.session.token_expiry_hard_timeout > Duration::from_secs(3600) {
+            self.err("session.token_expiry_hard_timeout must be at most 1h");
+        }
+        if c.revocation.hard_timeout.is_zero() {
+            self.err("revocation.hard_timeout must be greater than zero");
         }
         let l = &c.limits;
         if !(1024..=10_000).contains(&l.max_startup_packet_bytes) {
@@ -310,6 +346,11 @@ impl Validator {
         }
         if p.algorithms.is_empty() {
             self.err(format!("{ctx}: algorithms must not be empty"));
+        }
+        for name in &p.required_claims {
+            if let Err(e) = pgbearer_core::validate_claim_name(name) {
+                self.err(format!("{ctx}: required_claims: {e}"));
+            }
         }
         if p.kind == IdpType::Kubernetes {
             // The API server's own audience is carried by every pod's
@@ -455,8 +496,54 @@ impl Validator {
                 "{ctx}: pool.acquire_timeout and pool.connect_timeout must be greater than zero"
             ));
         }
-        if p.reset_query.trim().is_empty() {
-            self.err(format!("{ctx}: pool.reset_query must not be empty"));
+        if p.reuse != PoolReuse::None {
+            self.err(format!(
+                "{ctx}: pool.reuse other than none is not available yet (Phase 3a)"
+            ));
+        }
+        for (what, k) in [("keepalive", &b.keepalive)] {
+            if k.enabled && (k.idle.as_secs() == 0 || k.interval.as_secs() == 0 || k.count == 0) {
+                self.err(format!(
+                    "{ctx}: {what}.idle and {what}.interval must be at least 1s and {what}.count at least 1"
+                ));
+            }
+        }
+        let sk = &b.server_keepalive;
+        if sk.enabled && (sk.idle.as_secs() == 0 || sk.interval.as_secs() == 0 || sk.count == 0) {
+            self.err(format!(
+                "{ctx}: server_keepalive.idle and .interval must be at least 1s and .count at least 1"
+            ));
+        }
+    }
+
+    /// Report conditions on attributes the predicate's provider never
+    /// supplies (no groups, roles or scopes mapping): they are always
+    /// unknown.
+    fn unattested(&mut self, c: &Config, ctx: &str, p: &Predicate, consequence: &str) {
+        let Some(provider) = p.issuer.as_deref().and_then(|i| c.identity_provider(i)) else {
+            return;
+        };
+        let claims = provider.effective_claims();
+        let checks = [
+            (
+                "groups",
+                claims.groups.is_none(),
+                !p.groups_any.is_empty() || !p.groups_all.is_empty(),
+            ),
+            (
+                "roles",
+                claims.roles.is_none(),
+                !p.roles_any.is_empty() || !p.roles_all.is_empty(),
+            ),
+            ("scopes", claims.scopes.is_none(), !p.scopes_any.is_empty()),
+        ];
+        for (what, unmapped, used) in checks {
+            if unmapped && used {
+                self.err(format!(
+                    "{ctx}: identity provider {:?} does not map {what}, so a {what} condition is always unknown and {consequence}",
+                    provider.name
+                ));
+            }
         }
     }
 

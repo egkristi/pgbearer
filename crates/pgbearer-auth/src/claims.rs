@@ -33,6 +33,8 @@ pub(crate) struct ClaimRules {
     pub(crate) allowed_client_ids: Vec<String>,
     /// Required header `typ`.
     pub(crate) expected_typ: Option<String>,
+    /// Claims every token must carry.
+    pub(crate) required_claims: Vec<String>,
 }
 
 impl ClaimRules {
@@ -46,6 +48,7 @@ impl ClaimRules {
             tenants: cfg.tenants.clone(),
             required_scopes: cfg.required_scopes.clone(),
             allowed_client_ids: cfg.allowed_client_ids.clone(),
+            required_claims: cfg.required_claims.clone(),
             expected_typ: cfg.expected_typ.clone(),
         }
     }
@@ -146,6 +149,13 @@ pub(crate) fn check_constraints(
         if !typ_matches(expected, actual) {
             return Err(AuthError::BadType(sanitize(actual)));
         }
+    }
+    if let Some(missing) = rules
+        .required_claims
+        .iter()
+        .find(|name| lookup(claims, name).is_none_or(Value::is_null))
+    {
+        return Err(AuthError::MissingClaim(sanitize(missing)));
     }
     if !rules.tenants.is_empty() {
         let claim = rules.tenant_claim();
@@ -288,6 +298,7 @@ mod tests {
             required_scopes: vec![],
             allowed_client_ids: vec![],
             expected_typ: None,
+            required_claims: vec![],
         }
     }
 
@@ -548,6 +559,30 @@ mod tests {
         assert_eq!(
             check_constraints(&r, None, &obj(json!({"scope": ["y", "x"]}))),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn required_claims_must_be_present() {
+        let mut r = rules(IdpType::Entra);
+        r.required_claims = vec!["acct".into(), "/kubernetes.io/pod/uid".into()];
+        let ok = obj(json!({"acct": 0, "kubernetes.io": {"pod": {"uid": "u"}}}));
+        assert_eq!(check_constraints(&r, None, &ok), Ok(()));
+        assert_eq!(
+            check_constraints(
+                &r,
+                None,
+                &obj(json!({"kubernetes.io": {"pod": {"uid": "u"}}}))
+            ),
+            Err(AuthError::MissingClaim("acct".into()))
+        );
+        assert_eq!(
+            check_constraints(&r, None, &obj(json!({"acct": null, "kubernetes.io": {}}))),
+            Err(AuthError::MissingClaim("acct".into()))
+        );
+        assert_eq!(
+            check_constraints(&r, None, &obj(json!({"acct": 1}))),
+            Err(AuthError::MissingClaim("/kubernetes.io/pod/uid".into()))
         );
     }
 

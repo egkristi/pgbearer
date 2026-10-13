@@ -90,7 +90,7 @@ config:
         databases: ["orders"]
         pg_roles: ["orders_readonly"]
         default_pg_role: orders_readonly
-        max_connections_per_identity: 5
+        max_sessions_per_identity_per_replica: 5
     - name: orders-api
       when: { issuer: k8s, subject: "system:serviceaccount:orders:orders-api" }
       grant:

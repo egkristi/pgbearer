@@ -60,9 +60,12 @@
 // allowance in the commit that implements the crate.
 #![allow(clippy::todo)]
 
+pub mod admission;
 pub mod cancel;
 pub mod drain;
+pub mod relay_state;
 pub mod routing;
+pub mod startup_profile;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -77,6 +80,7 @@ use pgbearer_telemetry::Metrics;
 use pgbearer_tls::ServerTls;
 use tokio::net::TcpStream;
 
+pub use admission::Admission;
 pub use cancel::CancelRegistry;
 pub use drain::{DrainController, DrainState};
 pub use routing::Router;
@@ -132,29 +136,7 @@ pub struct Services {
     /// Drain state.
     pub drain: DrainController,
     /// Connection admission limits (global, pending-auth, per-identity, per-IP failures).
-    pub admission: Admission,
-}
-
-/// Connection admission control.
-///
-/// * at most `max_client_connections` concurrent client connections;
-/// * at most `max_pending_auth` connections that have not finished authentication;
-/// * per-identity session counts (keyed by `provider` + `subject` and grant) for
-///   `max_connections_per_identity`;
-/// * per-client-IP authentication failure counts in a sliding one-minute window
-///   (`auth_failures_per_ip_per_minute`); when exceeded, new connections from
-///   that IP are refused before authentication with FATAL `53300`
-///   (memory bounded: at most 100 000 tracked IPs, oldest evicted).
-pub struct Admission {
-    _private: (),
-}
-
-impl Admission {
-    /// Create from limits.
-    pub fn new(limits: &LimitsConfig) -> Admission {
-        let _ = limits;
-        todo!("pgbearer-session: Admission::new")
-    }
+    pub admission: Arc<Admission>,
 }
 
 /// Serve one client connection until it closes. Never panics on client input;

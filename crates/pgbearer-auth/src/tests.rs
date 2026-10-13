@@ -1379,6 +1379,7 @@ fn construction_needs_no_runtime_or_network() {
         claims: Default::default(),
         tenants: vec!["tenant-id".into()],
         required_scopes: vec!["Database.Connect".into()],
+        required_claims: vec![],
         allowed_client_ids: vec![],
         expected_typ: None,
         jwks: Default::default(),

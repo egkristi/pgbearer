@@ -1,60 +1,150 @@
-//! Access policy for pgbearer (ARCHITECTURE.md §9).
+//! Access policy for pgbearer (ARCHITECTURE.md §9.1).
 //!
-//! Evaluation of a [`ConnectRequest`] (all string comparisons are exact and
-//! case-sensitive):
+//! The engine is pure (no I/O), deterministic, and cheap to rebuild on every
+//! configuration reload. All string comparisons are exact and case-sensitive.
 //!
-//! 1. **Deny rules** are checked first. If any deny rule's predicate matches,
-//!    the result is `Deny` naming that rule.
-//! 2. **Candidate grants**: grants whose predicate matches the identity and
-//!    connection, whose `backend` equals the request's backend, and whose
-//!    `databases` contains the requested database or `*`. Order is config order.
-//!    No candidates → `Deny("no grant matches …")`.
-//! 3. **Role selection** by [`UserSemantics`]:
+//! # Three-valued conditions
+//!
+//! Every predicate condition evaluates to [`Truth::True`], [`Truth::False`] or
+//! [`Truth::Unknown`]. *Unknown* means the data the condition needs is not
+//! available, so the condition can neither be confirmed nor ruled out. A
+//! predicate is the conjunction of its set conditions: `False` if any
+//! condition is `False`, otherwise `Unknown` if any is `Unknown`, otherwise
+//! `True`. A predicate with no conditions is `True`.
+//!
+//! * **Grants match only on `True`.** Unknown data never grants access.
+//! * **Deny rules fire on `True` or `Unknown`**, unless the rule sets
+//!   `on_unknown: ignore` (then only on `True`). Unknown data never bypasses a
+//!   deny.
+//!
+//! Per condition (identity = the validated [`Identity`], provider = the
+//! `identity_providers` entry whose `name` equals `identity.provider`; if no
+//! such provider exists in the configuration, every provider-dependent
+//! condition below is `Unknown`):
+//!
+//! | Condition | Unknown when | Otherwise |
+//! |---|---|---|
+//! | `issuer` | never | `identity.provider == issuer` |
+//! | `kind` | predicate kind ≠ `unknown` and `identity.kind == Unknown` | equality |
+//! | `subject`, `subjects` | never | exact, or prefix when the pattern ends with `*` (only a trailing `*` is special); `subjects` = any of them |
+//! | `username` | `identity.username` is `None` | same matching as `subject` |
+//! | `roles_any`, `roles_all` | the provider maps no roles (`effective_claims().roles` is `None`) | non-empty intersection / subset |
+//! | `groups_any`, `groups_all` | `identity.groups_overage`, or the provider maps no groups | non-empty intersection / subset |
+//! | `scopes_any` | the provider maps no scopes | non-empty intersection |
+//! | `tenants` | `identity.tenant` is `None` | membership |
+//! | `client_ids` | `identity.client_id` is `None` | membership |
+//! | `claims[i]` | see [`claim_truth`] | see [`claim_truth`] |
+//! | `source_cidrs` | never | client IP in any network |
+//! | `listeners` | never | listener name in the list |
+//!
+//! Empty list conditions (`subjects: []`, `roles_any: []`, …) and unset
+//! options are not conditions at all.
+//!
+//! # Evaluation of a [`ConnectRequest`]
+//!
+//! 1. **Deny rules**, in configuration order. The first rule that fires
+//!    decides: `Deny` with `deny_rule` set, `terminate` copied from the rule,
+//!    and a reason naming the rule (and, when it fired on `Unknown`, which
+//!    data was unknown).
+//! 2. **Candidate grants**: grants whose predicate is `True`, whose
+//!    `grant.backend` equals the request's backend, and whose
+//!    `grant.databases` contains the requested database or `*`. Grants whose
+//!    predicate is `Unknown` are not candidates, but are remembered for the
+//!    denial reason. No candidates → `Deny` ("no grant matches …", naming
+//!    grants skipped because of unknown data, if any).
+//! 3. **Role selection** by [`UserSemantics`]. An empty `requested_user` is
+//!    treated like the identity's username.
 //!    * `auto`: if `requested_user` is a role in any candidate's `pg_roles`,
-//!      use it. Otherwise, if `requested_user` equals the identity's
-//!      `username`, its `subject`, or `*`, use the default role (below).
-//!      Otherwise deny ("requested user … is not an entitled role").
-//!    * `role`: `requested_user` must be an entitled role, else deny.
+//!      use it. Otherwise, if it equals the identity's `username`, its
+//!      `subject`, or `*`, use the default role. Otherwise deny ("requested
+//!      user … is not an entitled role").
+//!    * `role`: `requested_user` must be a role in a candidate's `pg_roles`,
+//!      else deny.
 //!    * `identity`: ignore `requested_user`; use the default role.
 //!
-//!    Default role: the `default_pg_role` of the first candidate that sets one;
-//!    if none sets one and the union of candidate roles has exactly one role,
-//!    that role; otherwise deny ("ambiguous default role; name a role as the
-//!    user"). An empty `requested_user` is treated like the identity's username.
-//! 4. **Result**: the *contributing grants* are the candidates whose
-//!    `pg_roles` contain the selected role. `matched_grants` lists all of them
-//!    in config order; per-grant settings (`pool_mode`,
-//!    `max_connections_per_identity`, `session_max_lifetime`,
-//!    `on_token_expiry`, `allow_privileged_role`) come from the **first**
-//!    contributing grant that sets each one (`allow_privileged_role` is true
-//!    only if the first contributing grant sets it).
+//!    **Default role:** the distinct `default_pg_role` values set by the
+//!    candidates. Exactly one → that role. More than one → deny ("conflicting
+//!    default roles …; name a role as the user"). None → if the union of the
+//!    candidates' `pg_roles` has exactly one role, that role; otherwise deny
+//!    ("ambiguous default role; name a role as the user").
+//! 4. **Result.** The *contributing grants* are the candidates whose
+//!    `pg_roles` contain the selected role. Their settings merge
+//!    **independently of their order**:
+//!    * `matched_grants`: the contributing grant names, in configuration order.
+//!    * `session_limits`: one entry per contributing grant that sets
+//!      `max_sessions_per_identity_per_replica` (every one is enforced),
+//!      sorted by grant name.
+//!    * `session_max_lifetime`: the minimum of the values set (or `None`).
+//!    * `on_token_expiry`: the strictest of the values set (or `None`); see
+//!      [`TokenExpiryAction::strictest`].
+//!    * `pool_mode`: `None` if no contributing grant sets one; `Session` if
+//!      any sets `Session` (and `pool_mode_conflict` is true when another
+//!      sets `Transaction`); otherwise `Transaction`.
+//!    * `acknowledged_role_risks`: the intersection of the contributing
+//!      grants' [`Grant::effective_role_risks`] (validation already requires
+//!      them to be equal for the same backend and role).
 //!
-//! Predicate matching (all set conditions must hold):
-//! * `issuer` = identity.provider; `kind` = identity.kind.
-//! * `subject`/`subjects`/`username`: exact, or prefix match when the pattern
-//!   ends with `*` (only a trailing `*` is special).
-//! * `roles_any`/`groups_any`/`scopes_any`: non-empty intersection;
-//!   `roles_all`/`groups_all`: subset. If the predicate has any group
-//!   condition and the identity has `groups_overage`, the predicate does
-//!   **not** match (fail closed) and the denial reason mentions the overage.
-//! * `tenants`, `client_ids`: identity value present and in the list.
-//! * `claims`: each [`ClaimPredicate`] on `identity.claim(name)`:
-//!   `exists` (presence), `equals` (JSON equality), `contains` (array contains
-//!   the value, or string equals it), `any_of` (equals one of). All set
-//!   sub-conditions must hold.
-//! * `source_cidrs`: client IP in any network; `listeners`: listener name in list.
+//! Decisions are invariant under any permutation of `policies` and `deny`
+//! except for which deny rule is named when several fire and the order of
+//! `matched_grants`; property tests check this.
 //!
-//! The engine is pure (no I/O) and cheap to rebuild on config reload.
+//! [`Grant::effective_role_risks`]: pgbearer_config::Grant::effective_role_risks
 
-// Some public items are still `todo!()` stubs (issue #5); remove this
-// allowance in the commit that implements the crate.
-#![allow(clippy::todo)]
+mod engine;
+mod predicate;
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // A panic in a test is a test failure.
+mod proptests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // A panic in a test is a test failure.
+mod tests;
+
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use pgbearer_config::{ClaimPredicate, Config, UserSemantics};
-use pgbearer_core::{Identity, PoolMode, TokenExpiryAction};
+use pgbearer_config::{ClaimPredicate, Config, DenyTermination, Predicate, UserSemantics};
+use pgbearer_core::{Identity, PoolMode, RoleRisk, TokenExpiryAction};
+
+/// A three-valued truth value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Truth {
+    /// The condition holds.
+    True,
+    /// The condition does not hold.
+    False,
+    /// The data needed to decide is not available.
+    Unknown,
+}
+
+impl Truth {
+    /// Conjunction: `False` dominates, then `Unknown`, then `True`.
+    pub fn and(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::False, _) | (_, Truth::False) => Truth::False,
+            (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+            (Truth::True, Truth::True) => Truth::True,
+        }
+    }
+
+    /// `True` for `true`, `False` for `false`.
+    pub fn from_bool(value: bool) -> Truth {
+        if value { Truth::True } else { Truth::False }
+    }
+}
+
+/// The result of evaluating one predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateResult {
+    /// The overall truth value.
+    pub truth: Truth,
+    /// Human-readable descriptions of the conditions that were `Unknown`, for
+    /// example `"groups (groups overage)"` or `"claim acct (absent)"`. Also
+    /// filled when the overall result is `False` because another condition
+    /// failed.
+    pub unknown: Vec<String>,
+}
 
 /// Input to a policy decision.
 #[derive(Debug, Clone, Copy)]
@@ -69,8 +159,17 @@ pub struct ConnectRequest<'a> {
     pub backend: &'a str,
     /// Listener name.
     pub listener: &'a str,
-    /// Client IP address.
+    /// Client IP address (from the TCP peer, or from a trusted PROXY header).
     pub client_ip: IpAddr,
+}
+
+/// A per-identity session limit from one contributing grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLimit {
+    /// Grant name (sessions are counted per issuer, subject and grant).
+    pub grant: String,
+    /// Maximum concurrent sessions per identity on one replica.
+    pub max_sessions_per_replica: u32,
 }
 
 /// An allowed connection.
@@ -82,18 +181,21 @@ pub struct Allowed {
     pub database: String,
     /// PostgreSQL role to log in as.
     pub pg_role: String,
-    /// All contributing grants, in config order.
+    /// All contributing grants, in configuration order.
     pub matched_grants: Vec<String>,
-    /// Pool mode override.
+    /// Pool mode override (`None`: the backend's default applies).
     pub pool_mode: Option<PoolMode>,
-    /// Per-identity connection limit.
-    pub max_connections_per_identity: Option<u32>,
-    /// Session lifetime override.
+    /// True when contributing grants set different pool modes (resolved to
+    /// session mode; recorded in the audit event).
+    pub pool_mode_conflict: bool,
+    /// Every contributing per-identity session limit.
+    pub session_limits: Vec<SessionLimit>,
+    /// Shortest session lifetime override among contributing grants.
     pub session_max_lifetime: Option<Duration>,
-    /// Token-expiry behaviour override.
+    /// Strictest token-expiry override among contributing grants.
     pub on_token_expiry: Option<TokenExpiryAction>,
-    /// Whether privileged roles are allowed.
-    pub allow_privileged_role: bool,
+    /// Role risks acknowledged by every contributing grant.
+    pub acknowledged_role_risks: BTreeSet<RoleRisk>,
 }
 
 /// A denied connection.
@@ -101,8 +203,13 @@ pub struct Allowed {
 pub struct Denied {
     /// Precise internal reason (audit only; never sent to the client).
     pub reason: String,
-    /// Name of the deny rule that matched, if any.
+    /// Name of the deny rule that fired, if any.
     pub deny_rule: Option<String>,
+    /// For a deny rule: how active sessions it newly matches are ended.
+    pub terminate: Option<DenyTermination>,
+    /// True when the decision depended on unknown data (a deny rule fired on
+    /// `Unknown`, or grants were skipped because of unknown data).
+    pub due_to_unknown: bool,
 }
 
 /// A policy decision.
@@ -112,6 +219,13 @@ pub enum Decision {
     Allow(Allowed),
     /// Denied.
     Deny(Denied),
+}
+
+impl Decision {
+    /// True for [`Decision::Allow`].
+    pub fn is_allow(&self) -> bool {
+        matches!(self, Decision::Allow(_))
+    }
 }
 
 /// One role an identity may use (for `pgbearerctl explain`).
@@ -129,56 +243,111 @@ pub struct Entitlement {
     pub default_pg_role: Option<String>,
 }
 
+/// How one rule evaluated (for `pgbearerctl explain`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleTrace {
+    /// Rule name.
+    pub name: String,
+    /// Predicate result.
+    pub predicate: PredicateResult,
+    /// For grants: whether backend and database matched the request.
+    pub target_matches: Option<bool>,
+}
+
+/// A decision with the evaluation of every rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    /// The decision [`PolicyEngine::evaluate`] would return.
+    pub decision: Decision,
+    /// Deny rules, in configuration order.
+    pub deny_rules: Vec<RuleTrace>,
+    /// Grants, in configuration order.
+    pub grants: Vec<RuleTrace>,
+}
+
 /// The compiled policy.
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
-    _private: (),
+    inner: engine::Engine,
 }
 
 impl PolicyEngine {
-    /// Build from a validated config (`policies`, `deny`, `session.user_semantics`).
+    /// Build from a validated configuration (`policies`, `deny`,
+    /// `identity_providers` for claim mappings, `session.user_semantics`).
     pub fn from_config(config: &Config) -> PolicyEngine {
-        let _ = config;
-        todo!("pgbearer-policy: PolicyEngine::from_config")
+        PolicyEngine {
+            inner: engine::Engine::new(config),
+        }
     }
 
     /// Decide a connection request.
     pub fn evaluate(&self, req: &ConnectRequest<'_>) -> Decision {
-        let _ = req;
-        todo!("pgbearer-policy: PolicyEngine::evaluate")
+        self.inner.evaluate(req)
     }
 
-    /// Grants whose predicate matches the identity for the given listener and
-    /// client IP, ignoring backend and database (for diagnostics).
+    /// Decide a request and report how every rule evaluated.
+    pub fn explain(&self, req: &ConnectRequest<'_>) -> Explanation {
+        self.inner.explain(req)
+    }
+
+    /// Grants whose predicate is `True` for the identity on the given
+    /// listener and client IP, ignoring backend and database (diagnostics).
     pub fn entitlements(
         &self,
         identity: &Identity,
         listener: &str,
         client_ip: IpAddr,
     ) -> Vec<Entitlement> {
-        let _ = (identity, listener, client_ip);
-        todo!("pgbearer-policy: PolicyEngine::entitlements")
+        self.inner.entitlements(identity, listener, client_ip)
     }
 
-    /// Name of the first deny rule matching the identity, if any (for diagnostics).
+    /// Name of the first deny rule that fires for the identity (on `True`, or
+    /// on `Unknown` unless the rule ignores unknown data), if any.
     pub fn matching_deny_rule(
         &self,
         identity: &Identity,
         listener: &str,
         client_ip: IpAddr,
     ) -> Option<String> {
-        let _ = (identity, listener, client_ip);
-        todo!("pgbearer-policy: PolicyEngine::matching_deny_rule")
+        self.inner.matching_deny_rule(identity, listener, client_ip)
     }
 
     /// The configured user semantics.
     pub fn user_semantics(&self) -> UserSemantics {
-        todo!("pgbearer-policy: PolicyEngine::user_semantics")
+        self.inner.user_semantics()
     }
 }
 
-/// Evaluate one claim predicate against an identity (exposed for testing).
-pub fn claim_matches(identity: &Identity, predicate: &ClaimPredicate) -> bool {
-    let _ = (identity, predicate);
-    todo!("pgbearer-policy: claim_matches")
+/// Evaluate a predicate against an identity and connection. `provider` is
+/// the identity's provider configuration, or `None` if it is not configured
+/// (then provider-dependent conditions are `Unknown`).
+pub fn evaluate_predicate(
+    predicate: &Predicate,
+    identity: &Identity,
+    provider: Option<&pgbearer_config::IdentityProviderConfig>,
+    listener: &str,
+    client_ip: IpAddr,
+) -> PredicateResult {
+    let provider = provider.map(predicate::ProviderInfo::from_config);
+    let ctx = predicate::EvalCtx::new(identity, provider.as_ref(), listener, client_ip);
+    predicate::CompiledPredicate::compile(predicate).eval(&ctx)
+}
+
+/// Evaluate one claim condition. The claim is looked up with
+/// [`Identity::claim`] (literal name, dotted path, or JSON Pointer).
+///
+/// * `exists: true/false`: presence or absence; never `Unknown`.
+/// * When the claim is **absent** (missing, or JSON `null`), `equals`,
+///   `contains` and `any_of` are `Unknown`.
+/// * `equals`: JSON equality, except that a string and a number compare
+///   equal when the number's decimal form equals the string (claims such as
+///   GitHub's `repository_id` are strings that look like numbers, and YAML
+///   authors may write either).
+/// * `contains`: the claim is an array containing the value (same equality),
+///   or a string equal to it (a single-valued claim).
+/// * `any_of`: the claim equals one of the values (same equality).
+///
+/// All set sub-conditions must hold (three-valued conjunction).
+pub fn claim_truth(identity: &Identity, predicate: &ClaimPredicate) -> Truth {
+    predicate::claim_truth(identity, predicate)
 }

@@ -44,6 +44,32 @@ dates.
   zizmor, TruffleHog and OpenSSF Scorecard; Dependabot for crates, actions
   and container images. `SECURITY.md` describes private vulnerability
   reporting and the scans.
+- `pgbearer-policy`: a three-valued policy engine. A claim condition on a
+  missing (or `null`) claim is *unknown*: grants match only when every
+  condition is true, and deny rules fail closed (they also fire on unknown)
+  unless they set `on_unknown: ignore`. Deny rules choose how a live session
+  ends (`terminate: at_safe_point` or `immediate`). Matching grants merge
+  independently of their order: the shortest lifetime, the strictest token
+  expiry action, every per-identity session limit, and `session` pool mode
+  over `transaction`. `explain` and `entitlements` support diagnostics, and
+  property tests check that decisions do not depend on rule order.
+- Role risk classes (`superuser`, `createrole`, `replication`, `bypassrls`,
+  `server_files`, `admin_option`, `predefined_admin`, `database_owner`,
+  `createdb`, `read_all`). A grant must acknowledge the risky
+  capabilities its PostgreSQL role can reach with `acknowledged_role_risks`;
+  grants for the same backend and role must acknowledge the same set.
+- `required_claims` on identity providers: a token without one of the listed
+  claims, or with a `null` value, is rejected. The examples use it so that
+  deny rules on optional claims never see an unknown value.
+- Configuration for TCP keepalive and `TCP_USER_TIMEOUT` on client and backend
+  connections, server-side keepalive and `client_connection_check_interval`
+  (sent as backend startup parameters), `backends[].cancel_endpoint`,
+  `pool.reuse` (rejected until Phase 3a), `revocation.hard_timeout` (60 s) and
+  `session.token_expiry_hard_timeout` (120 s).
+- Interface contracts, not yet implemented, for the backend pool (connect,
+  role inspection, leases, generations, cancel targets) and the session
+  building blocks (startup profile, relay state, cancel registry, admission
+  control).
 
 ### Changed
 
@@ -56,6 +82,12 @@ dates.
   order-independent; revocation and token expiry have hard deadlines
   (architecture revision after the audit).
 - `token_expiry_grace` defaults to 60 seconds.
+- `max_connections_per_identity` is now
+  `max_sessions_per_identity_per_replica`, which names what it counts and
+  where. `allow_privileged_role: true` is deprecated; it acknowledges every
+  role risk.
+- CloudNativePG backends verify the TLS server name
+  `<cluster>-<service>.<namespace>.svc` by default.
 - The GitHub Actions preset uses the immutable `repository_owner_id` as the
   tenant.
 - The Helm chart mounts the configuration as a directory so hot reload works,
@@ -78,9 +110,18 @@ dates.
 - Claim names containing dots (`kubernetes.io`, URL-style names) could not be
   addressed in policy.
 
+### Removed
+
+- `on_token_expiry: ignore`: sessions always end after their token expires
+  (`terminate_when_idle` with a hard deadline, or `terminate`).
+- `pool.reset_query`: connection reset will only ever use `DISCARD ALL`.
+
 ### Security
 
 - `pool_mode: transaction` requires `experimental.transaction_pooling`.
+- Deny rules fail closed on unknown claims. A grant, or a deny rule without
+  `on_unknown: ignore`, that tests groups, roles or scopes on a provider that
+  does not map them is a configuration error.
 - PROXY protocol requires a `trusted_proxies` list, so clients cannot forge
   their source address.
 - Grants must name an issuer; per-grant session lifetimes may only shorten

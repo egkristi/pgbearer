@@ -23,14 +23,14 @@
 pub mod duration;
 mod validate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub use pgbearer_core::{IdentityKind, PoolMode, TokenExpiryAction};
+pub use pgbearer_core::{IdentityKind, PoolMode, RoleRisk, TokenExpiryAction};
 
 /// The only supported `apiVersion`.
 pub const API_VERSION: &str = "pgbearer/v1alpha1";
@@ -92,6 +92,9 @@ pub struct Config {
     /// Graceful shutdown.
     #[serde(default)]
     pub drain: DrainConfig,
+    /// Revocation of active sessions after a policy change.
+    #[serde(default)]
+    pub revocation: RevocationConfig,
     /// Audit logging.
     #[serde(default)]
     pub audit: AuditConfig,
@@ -213,6 +216,9 @@ pub struct ListenerConfig {
     /// Allow tokens over unencrypted connections. Development only.
     #[serde(default)]
     pub insecure_allow_plaintext_auth: bool,
+    /// TCP keepalive on client sockets.
+    #[serde(default)]
+    pub keepalive: KeepaliveConfig,
 }
 
 /// Listener TLS settings.
@@ -321,6 +327,11 @@ pub struct IdentityProviderConfig {
     /// Scopes that must all be present in delegated (user) tokens.
     #[serde(default)]
     pub required_scopes: Vec<String>,
+    /// Claims every token must carry (same name syntax as policy claim
+    /// conditions). A token without one of them is rejected, so policy
+    /// conditions on these claims are never *unknown*.
+    #[serde(default)]
+    pub required_claims: Vec<String>,
     /// If set, only tokens requested by these OAuth clients are accepted.
     #[serde(default)]
     pub allowed_client_ids: Vec<String>,
@@ -547,9 +558,130 @@ pub struct BackendConfig {
     /// Pool settings.
     #[serde(default)]
     pub pool: PoolConfig,
+    /// Where cancel requests for a session go. Default: `discovered` for
+    /// `cnpg` backends, `connected` for `static` ones (ARCHITECTURE §11).
+    #[serde(default)]
+    pub cancel_endpoint: Option<CancelEndpoint>,
+    /// TCP keepalive on backend sockets.
+    #[serde(default)]
+    pub keepalive: KeepaliveConfig,
+    /// Keepalive and connection-check settings sent to PostgreSQL as startup
+    /// parameters, so orphaned backends end when pgbearer or a node is gone.
+    #[serde(default)]
+    pub server_keepalive: ServerKeepaliveConfig,
+}
+
+/// Where cancel requests for a backend connection are sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelEndpoint {
+    /// The server address reported by `inet_server_addr()`/`inet_server_port()`
+    /// when the reported pid matches (the physical instance behind a Service).
+    Discovered,
+    /// The address the TCP connection is connected to.
+    Connected,
+}
+
+/// TCP keepalive settings for a socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct KeepaliveConfig {
+    /// Enable `SO_KEEPALIVE` (and `TCP_USER_TIMEOUT` on Linux).
+    pub enabled: bool,
+    /// Idle time before the first probe.
+    #[serde(with = "duration")]
+    pub idle: Duration,
+    /// Interval between probes.
+    #[serde(with = "duration")]
+    pub interval: Duration,
+    /// Unanswered probes before the connection is dropped.
+    pub count: u32,
+    /// `TCP_USER_TIMEOUT`: how long sent data may stay unacknowledged (Linux).
+    #[serde(with = "duration")]
+    pub user_timeout: Duration,
+}
+
+impl Default for KeepaliveConfig {
+    fn default() -> Self {
+        KeepaliveConfig {
+            enabled: true,
+            idle: Duration::from_secs(30),
+            interval: Duration::from_secs(10),
+            count: 3,
+            user_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Server-side keepalive settings sent as startup parameters
+/// (`tcp_keepalives_idle`, `tcp_keepalives_interval`, `tcp_keepalives_count`,
+/// `client_connection_check_interval`). A client's own value for one of
+/// these wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ServerKeepaliveConfig {
+    /// Send the settings.
+    pub enabled: bool,
+    /// `tcp_keepalives_idle`.
+    #[serde(with = "duration")]
+    pub idle: Duration,
+    /// `tcp_keepalives_interval`.
+    #[serde(with = "duration")]
+    pub interval: Duration,
+    /// `tcp_keepalives_count`.
+    pub count: u32,
+    /// `client_connection_check_interval`.
+    #[serde(with = "duration")]
+    pub connection_check_interval: Duration,
+}
+
+impl Default for ServerKeepaliveConfig {
+    fn default() -> Self {
+        ServerKeepaliveConfig {
+            enabled: true,
+            idle: Duration::from_secs(30),
+            interval: Duration::from_secs(10),
+            count: 3,
+            connection_check_interval: Duration::from_secs(10),
+        }
+    }
+}
+
+impl ServerKeepaliveConfig {
+    /// The startup parameters (empty when disabled). Values are whole
+    /// seconds, and milliseconds for `client_connection_check_interval`.
+    pub fn startup_parameters(&self) -> Vec<(String, String)> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        vec![
+            (
+                "tcp_keepalives_idle".into(),
+                self.idle.as_secs().to_string(),
+            ),
+            (
+                "tcp_keepalives_interval".into(),
+                self.interval.as_secs().to_string(),
+            ),
+            ("tcp_keepalives_count".into(), self.count.to_string()),
+            (
+                "client_connection_check_interval".into(),
+                self.connection_check_interval.as_millis().to_string(),
+            ),
+        ]
+    }
 }
 
 impl BackendConfig {
+    /// The effective cancel endpoint mode.
+    pub fn effective_cancel_endpoint(&self) -> CancelEndpoint {
+        self.cancel_endpoint.unwrap_or(if self.cnpg.is_some() {
+            CancelEndpoint::Discovered
+        } else {
+            CancelEndpoint::Connected
+        })
+    }
+
     /// Host and port to connect to.
     pub fn host_port(&self) -> Option<(String, u16)> {
         if let Some(s) = &self.static_endpoint {
@@ -558,12 +690,18 @@ impl BackendConfig {
         self.cnpg.as_ref().map(|c| (c.service_host(), c.port))
     }
 
-    /// The name to verify in the server certificate (and send as SNI).
+    /// The name to verify in the server certificate (and send as SNI). For
+    /// CNPG backends the default is `<cluster>-<svc>.<namespace>.svc`, which
+    /// both operator-generated and user-provided CNPG server certificates
+    /// contain; static backends default to their host.
     pub fn tls_server_name(&self) -> Option<String> {
-        self.tls
-            .server_name
-            .clone()
-            .or_else(|| self.host_port().map(|(h, _)| h))
+        if let Some(name) = &self.tls.server_name {
+            return Some(name.clone());
+        }
+        if let Some(c) = &self.cnpg {
+            return Some(c.service_name_svc());
+        }
+        self.host_port().map(|(h, _)| h)
     }
 }
 
@@ -598,6 +736,16 @@ pub struct CnpgEndpoint {
 }
 
 impl CnpgEndpoint {
+    /// `<cluster>-<svc>.<namespace>.svc`.
+    pub fn service_name_svc(&self) -> String {
+        format!(
+            "{}-{}.{}.svc",
+            self.cluster,
+            self.service.suffix(),
+            self.namespace
+        )
+    }
+
     /// `<cluster>-<svc>.<namespace>.svc.<domain>`.
     pub fn service_host(&self) -> String {
         format!(
@@ -786,8 +934,22 @@ pub struct PoolConfig {
     /// Run a cheap health check on checkout if idle longer than this.
     #[serde(with = "duration")]
     pub health_check_idle: Duration,
-    /// Query used to reset a session-mode connection before reuse.
-    pub reset_query: String,
+    /// Backend connection reuse between client sessions. Only `none` is
+    /// available until Phase 3a.
+    pub reuse: PoolReuse,
+}
+
+/// Reuse of backend connections between client sessions (ARCHITECTURE §10.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolReuse {
+    /// A fresh backend connection per client session, closed afterwards.
+    #[default]
+    None,
+    /// Reuse only for the same identity (and startup profile). Phase 3a.
+    SameIdentity,
+    /// Reuse for any identity mapped to the same role (and startup profile). Phase 3a.
+    SameRole,
 }
 
 impl Default for PoolConfig {
@@ -801,7 +963,7 @@ impl Default for PoolConfig {
             max_lifetime: Duration::from_secs(3600),
             connect_timeout: Duration::from_secs(5),
             health_check_idle: Duration::from_secs(30),
-            reset_query: "DISCARD ALL".into(),
+            reuse: PoolReuse::None,
         }
     }
 }
@@ -859,6 +1021,37 @@ pub struct DenyRule {
     /// Predicate.
     #[serde(default)]
     pub when: Predicate,
+    /// What happens when the data the predicate needs is unknown (groups
+    /// overage, a provider that does not map groups/roles/scopes, an absent
+    /// claim, identity kind `unknown`). The default fires the rule.
+    #[serde(default)]
+    pub on_unknown: UnknownHandling,
+    /// How matching active sessions are ended after a reload adds this rule.
+    #[serde(default)]
+    pub terminate: DenyTermination,
+}
+
+/// Treatment of unknown data in a deny rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownHandling {
+    /// Fire the rule (fail closed).
+    #[default]
+    Deny,
+    /// Do not fire the rule.
+    Ignore,
+}
+
+/// How a deny rule ends active sessions it newly matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DenyTermination {
+    /// At the session's next safe point, and at the latest after
+    /// `revocation.hard_timeout`.
+    #[default]
+    AtSafePoint,
+    /// At once (emergency denies).
+    Immediate,
 }
 
 /// A predicate. All set conditions must hold (logical AND). List conditions
@@ -934,19 +1127,36 @@ pub struct Grant {
     /// Pool mode override.
     #[serde(default)]
     pub pool_mode: Option<PoolMode>,
-    /// Maximum concurrent client sessions for one identity under this grant.
+    /// Per replica: maximum concurrent client sessions for one identity
+    /// (issuer and subject) under this grant.
     #[serde(default)]
-    pub max_connections_per_identity: Option<u32>,
+    pub max_sessions_per_identity_per_replica: Option<u32>,
     /// Session lifetime override.
     #[serde(default, with = "duration::option")]
     pub session_max_lifetime: Option<Duration>,
     /// Token-expiry behaviour override.
     #[serde(default)]
     pub on_token_expiry: Option<TokenExpiryAction>,
-    /// Allow roles that are superuser, CREATEROLE, REPLICATION or BYPASSRLS.
-    /// Intended only for break-glass grants.
+    /// Role risks this grant accepts (ARCHITECTURE §9.2). A reachable risk
+    /// that blocks by default refuses the connection unless listed here.
+    #[serde(default)]
+    pub acknowledged_role_risks: BTreeSet<RoleRisk>,
+    /// Deprecated: `true` acknowledges every role risk. Use
+    /// `acknowledged_role_risks` instead.
     #[serde(default)]
     pub allow_privileged_role: bool,
+}
+
+impl Grant {
+    /// The acknowledged role risks, with the deprecated
+    /// `allow_privileged_role: true` meaning all of them.
+    pub fn effective_role_risks(&self) -> BTreeSet<RoleRisk> {
+        if self.allow_privileged_role {
+            RoleRisk::ALL.into_iter().collect()
+        } else {
+            self.acknowledged_role_risks.clone()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -967,6 +1177,24 @@ pub enum UserSemantics {
     Identity,
 }
 
+/// Revocation of active sessions (ARCHITECTURE §12).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RevocationConfig {
+    /// After a reload revokes a session, it ends at its next safe point and
+    /// at the latest after this long.
+    #[serde(with = "duration")]
+    pub hard_timeout: Duration,
+}
+
+impl Default for RevocationConfig {
+    fn default() -> Self {
+        RevocationConfig {
+            hard_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
 /// Session lifetime settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -978,6 +1206,10 @@ pub struct SessionConfig {
     /// Grace period after `exp`.
     #[serde(with = "duration")]
     pub token_expiry_grace: Duration,
+    /// After `exp + token_expiry_grace`, the session ends at the latest after
+    /// this long, whatever `on_token_expiry` says.
+    #[serde(with = "duration")]
+    pub token_expiry_hard_timeout: Duration,
     /// Hard cap on session lifetime.
     #[serde(with = "duration")]
     pub max_lifetime: Duration,
@@ -998,6 +1230,7 @@ impl Default for SessionConfig {
             user_semantics: UserSemantics::Auto,
             on_token_expiry: TokenExpiryAction::TerminateWhenIdle,
             token_expiry_grace: Duration::from_secs(60),
+            token_expiry_hard_timeout: Duration::from_secs(120),
             max_lifetime: Duration::from_secs(12 * 3600),
             idle_timeout: Duration::from_secs(3600),
             idle_in_transaction_timeout: Duration::from_secs(600),

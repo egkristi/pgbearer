@@ -28,6 +28,9 @@ identity_providers:
     audiences: ["11111111-1111-1111-1111-111111111111"]   # the pgbearer API's client ID
     tenants: ["00000000-0000-0000-0000-000000000000"]
     required_scopes: ["Database.Connect"]
+    # Tokens must carry "acct" (enable the optional claim in the app
+    # registration), so the guest deny rule below is never "unknown".
+    required_claims: ["acct"]
   - name: k8s
     type: kubernetes
     audiences: ["pgbearer"]
@@ -36,6 +39,7 @@ identity_providers:
   - name: github
     type: github-actions
     audiences: ["pgbearer"]
+    required_claims: ["repository_id", "event_name", "ref", "job_workflow_ref"]
 
 backends:
   - name: orders
@@ -75,7 +79,7 @@ policies:
       databases: ["orders"]
       pg_roles: ["orders_readonly"]
       default_pg_role: orders_readonly
-      max_connections_per_identity: 5
+      max_sessions_per_identity_per_replica: 5
 
   - name: orders-api
     when:
@@ -109,8 +113,8 @@ policies:
       session_max_lifetime: 30m
 
 deny:
-  # Requires the optional claim "acct" in the Entra app registration; a token
-  # without it does not match this rule.
+  # Deny rules fail closed: a token without "acct" would match this rule,
+  # which is why the entra provider lists it in required_claims.
   - name: no-guests
     when:
       issuer: entra

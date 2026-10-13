@@ -478,6 +478,7 @@ impl MockIssuer {
             claims: ClaimMapping::default(),
             tenants: Vec::new(),
             required_scopes: Vec::new(),
+            required_claims: Vec::new(),
             allowed_client_ids: Vec::new(),
             expected_typ: None,
             jwks: JwksConfig::default(),

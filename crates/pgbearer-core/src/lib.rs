@@ -204,16 +204,106 @@ impl fmt::Display for PoolMode {
 }
 
 /// What to do when the client's access token expires during a session.
+///
+/// Whatever the action, a session never outlives
+/// `exp + token_expiry_grace + token_expiry_hard_timeout` (ARCHITECTURE §12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenExpiryAction {
-    /// Close the session at the next idle point after `exp + grace`.
+    /// Close the session at its next safe point after `exp + grace`.
     #[default]
     TerminateWhenIdle,
     /// Close the session at `exp + grace`, even in the middle of a transaction.
     Terminate,
-    /// Do nothing; only `max_lifetime` applies.
-    Ignore,
+}
+
+impl TokenExpiryAction {
+    /// The stricter of two actions (`Terminate` is stricter).
+    pub fn strictest(self, other: TokenExpiryAction) -> TokenExpiryAction {
+        if self == TokenExpiryAction::Terminate || other == TokenExpiryAction::Terminate {
+            TokenExpiryAction::Terminate
+        } else {
+            TokenExpiryAction::TerminateWhenIdle
+        }
+    }
+}
+
+/// A privilege risk of a PostgreSQL role, found by walking everything the
+/// login role can reach through SET, INHERIT and ADMIN membership edges
+/// (ARCHITECTURE §9.2). Grants acknowledge the risks they accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleRisk {
+    /// SUPERUSER.
+    Superuser,
+    /// CREATEROLE.
+    Createrole,
+    /// REPLICATION.
+    Replication,
+    /// BYPASSRLS.
+    Bypassrls,
+    /// `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program`.
+    ServerFiles,
+    /// ADMIN OPTION on a reachable role (the role can grant itself more roles).
+    AdminOption,
+    /// `pg_signal_backend`, `pg_write_all_data`, `pg_create_subscription`,
+    /// `pg_use_reserved_connections`, `pg_maintain`, `pg_checkpoint`,
+    /// `pg_signal_autovacuum_worker`.
+    PredefinedAdmin,
+    /// Owns a database.
+    DatabaseOwner,
+    /// CREATEDB.
+    Createdb,
+    /// `pg_read_all_data`, `pg_read_all_settings`, `pg_read_all_stats`,
+    /// `pg_monitor`, `pg_stat_scan_tables`.
+    ReadAll,
+}
+
+impl RoleRisk {
+    /// Every risk class.
+    pub const ALL: [RoleRisk; 10] = [
+        RoleRisk::Superuser,
+        RoleRisk::Createrole,
+        RoleRisk::Replication,
+        RoleRisk::Bypassrls,
+        RoleRisk::ServerFiles,
+        RoleRisk::AdminOption,
+        RoleRisk::PredefinedAdmin,
+        RoleRisk::DatabaseOwner,
+        RoleRisk::Createdb,
+        RoleRisk::ReadAll,
+    ];
+
+    /// Whether an unacknowledged risk of this class refuses the connection.
+    /// The others are allowed but warned about and audited.
+    pub fn blocks_by_default(self) -> bool {
+        !matches!(
+            self,
+            RoleRisk::DatabaseOwner | RoleRisk::Createdb | RoleRisk::ReadAll
+        )
+    }
+
+    /// The configuration name (`snake_case`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoleRisk::Superuser => "superuser",
+            RoleRisk::Createrole => "createrole",
+            RoleRisk::Replication => "replication",
+            RoleRisk::Bypassrls => "bypassrls",
+            RoleRisk::ServerFiles => "server_files",
+            RoleRisk::AdminOption => "admin_option",
+            RoleRisk::PredefinedAdmin => "predefined_admin",
+            RoleRisk::DatabaseOwner => "database_owner",
+            RoleRisk::Createdb => "createdb",
+            RoleRisk::ReadAll => "read_all",
+        }
+    }
+}
+
+impl fmt::Display for RoleRisk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A random, unguessable session identifier (128 bits, hex encoded).
