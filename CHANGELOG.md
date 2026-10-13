@@ -38,6 +38,12 @@ dates.
   CloudNativePG example and guides for CNPG, Entra ID and local development.
 - Analysis of the external design audit of 9 October 2026
   ([docs/reviews/2026-10-09-audit-response.md](docs/reviews/2026-10-09-audit-response.md)).
+- Security scanning: CodeQL for Rust and GitHub Actions, daily RustSec
+  advisories, dependency review on pull requests, Trivy (dependencies,
+  Dockerfile/Helm/Kubernetes misconfigurations, secrets, container image),
+  zizmor, TruffleHog and OpenSSF Scorecard; Dependabot for crates, actions
+  and container images. `SECURITY.md` describes private vulnerability
+  reporting and the scans.
 
 ### Changed
 
@@ -57,6 +63,13 @@ dates.
   `maxUnavailable: 1`, and paces rollouts with `minReadySeconds`.
 
 ### Fixed
+
+- CI: cargo-deny rejected the internal path dependencies as wildcards
+  ([#3](https://github.com/egkristi/pgbearer/issues/3)); rustdoc failed on a
+  link to the feature-gated `testing::MockIssuer`
+  ([#4](https://github.com/egkristi/pgbearer/issues/4)); clippy failed on
+  unimplemented stubs, and the CI toolchain is now pinned with a non-blocking
+  latest-stable job ([#5](https://github.com/egkristi/pgbearer/issues/5)).
 
 - A cancelled or failed `FrameReader` body operation could be retried and
   write the same bytes twice; the reader is now poisoned instead.

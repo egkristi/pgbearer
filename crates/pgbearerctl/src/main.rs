@@ -12,6 +12,10 @@
 //!   prints the access token to stdout (instructions go to stderr), so it can
 //!   be used as `PGPASSWORD=$(pgbearerctl token …) psql …`.
 
+// Some public items are still `todo!()` stubs (issue #5); remove this
+// allowance in the commit that implements the crate.
+#![allow(clippy::todo)]
+
 use std::process::ExitCode;
 
 use clap::Parser;

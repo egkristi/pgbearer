@@ -1,0 +1,136 @@
+# Security scans beyond CodeQL. Findings are uploaded to GitHub code
+# scanning (Security tab) as SARIF where the tool supports it.
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Daily: new advisories and CVEs appear without any code change.
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-advisories:
+    name: Rust advisories (RustSec)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure
+
+  trivy-fs:
+    name: Trivy (dependencies, IaC, secrets)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Scan repository
+        # Cargo.lock vulnerabilities, misconfigurations in the Dockerfile,
+        # Helm chart and Kubernetes manifests, and committed secrets.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src aquasec/trivy:latest fs \
+            --scanners vuln,misconfig,secret \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --format sarif --output /src/trivy-fs.sarif .
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-fs.sarif') != ''
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  trivy-image:
+    name: Trivy (container image)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: pgbearer:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Scan image
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" \
+            aquasec/trivy:latest image \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --format sarif --output /out/trivy-image.sarif pgbearer:scan
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  zizmor:
+    name: zizmor (workflow security)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Audit GitHub Actions workflows
+        run: pipx run zizmor --format sarif . > zizmor.sarif || true
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('zizmor.sarif') != ''
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+  secrets:
+    name: secret scan (TruffleHog)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan git history for verified secrets
+        run: |
+          docker run --rm -v "$PWD:/repo" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            trufflesecurity/trufflehog:latest \
+            git file:///repo --only-verified --fail --no-update

@@ -46,6 +46,10 @@
 //!
 //! The engine is pure (no I/O) and cheap to rebuild on config reload.
 
+// Some public items are still `todo!()` stubs (issue #5); remove this
+// allowance in the commit that implements the crate.
+#![allow(clippy::todo)]
+
 use std::net::IpAddr;
 use std::time::Duration;
 

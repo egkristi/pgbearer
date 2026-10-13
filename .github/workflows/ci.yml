@@ -13,6 +13,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: "0"
+  # The project's pinned Rust version. Bump it deliberately (new clippy lints
+  # arrive with it); the `latest-stable` job shows what the next bump needs.
+  RUST_TOOLCHAIN: "1.97.0"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -23,9 +26,12 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -33,9 +39,12 @@ jobs:
     name: clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -49,31 +58,54 @@ jobs:
         # Supported baseline: PostgreSQL 16+ (PLAN.md decision D8).
         postgres: ["16", "17", "18"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: pg${{ matrix.postgres }}
       - name: Install PostgreSQL ${{ matrix.postgres }}
+        env:
+          PG_VERSION: ${{ matrix.postgres }}
         run: |
           sudo apt-get update
           sudo apt-get install -y curl ca-certificates postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y postgresql-${{ matrix.postgres }} postgresql-client-${{ matrix.postgres }}
+          sudo apt-get install -y "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}"
           sudo systemctl stop postgresql || true
-          echo "PGBEARER_TEST_PG_BIN=/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_ENV"
+          echo "PGBEARER_TEST_PG_BIN=/usr/lib/postgresql/${PG_VERSION}/bin" >> "$GITHUB_ENV"
       - name: Unit and integration tests
         run: cargo test --workspace --all-features --locked
       - name: Doc tests and docs
-        run: cargo doc --workspace --no-deps --locked
+        run: cargo doc --workspace --all-features --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  latest-stable:
+    name: latest stable Rust (non-blocking)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
 
   deny:
     name: cargo-deny
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
@@ -83,7 +115,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [fmt, clippy]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - name: Build image (no push)
         uses: docker/build-push-action@v6
@@ -98,7 +132,9 @@ jobs:
     name: helm lint
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: azure/setup-helm@v4
       - run: helm lint deploy/helm/pgbearer
       - run: helm template pgbearer deploy/helm/pgbearer > /dev/null

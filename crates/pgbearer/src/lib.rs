@@ -30,6 +30,12 @@
 //! [`DrainController`]; wait for sessions until `drain.hard_timeout`; then
 //! close pools and stop background tasks.
 
+// Some public items are still `todo!()` stubs (issue #5); remove this
+// allowance in the commit that implements the crate.
+#![allow(clippy::todo)]
+// `RunningApp` gets real private fields with the implementation.
+#![allow(clippy::manual_non_exhaustive)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

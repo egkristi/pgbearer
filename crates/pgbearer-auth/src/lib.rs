@@ -53,7 +53,7 @@
 //! Metrics: `pgbearer_auth_attempts_total`, `pgbearer_auth_duration_seconds`,
 //! `pgbearer_jwks_refresh_total`, `pgbearer_jwks_age_seconds`.
 //!
-//! With the `testing` Cargo feature, [`testing::MockIssuer`] provides an
+//! With the `testing` Cargo feature, `testing::MockIssuer` provides an
 //! in-process OpenID Connect provider for tests.
 
 mod claims;

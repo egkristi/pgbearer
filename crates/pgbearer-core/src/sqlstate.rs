@@ -30,3 +30,16 @@ pub const CANNOT_CONNECT_NOW: &str = "57P03";
 pub const IDLE_SESSION_TIMEOUT: &str = "57P05";
 /// `XX000` internal_error.
 pub const INTERNAL_ERROR: &str = "XX000";
+/// `08007` transaction_resolution_unknown: the connection was lost while a
+/// request was in flight, so its outcome (for example a COMMIT) is unknown.
+pub const TRANSACTION_RESOLUTION_UNKNOWN: &str = "08007";
+/// `22023` invalid_parameter_value.
+pub const INVALID_PARAMETER_VALUE: &str = "22023";
+/// `42501` insufficient_privilege.
+pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
+/// `42704` undefined_object (for example an unknown configuration parameter).
+pub const UNDEFINED_OBJECT: &str = "42704";
+/// `54023` too_many_arguments.
+pub const TOO_MANY_ARGUMENTS: &str = "54023";
+/// `57014` query_canceled.
+pub const QUERY_CANCELED: &str = "57014";

@@ -1,0 +1,41 @@
+# Dependabot version updates. Security updates for vulnerable dependencies
+# are raised independently of this schedule once "Dependabot security
+# updates" is enabled in the repository settings (SECURITY.md).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels: [dependencies, rust]
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Patch and minor updates of crates.io dependencies in one PR; majors
+      # come one by one because they may need code changes.
+      rust-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, container]
+    commit-message:
+      prefix: "image"

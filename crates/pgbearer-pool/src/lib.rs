@@ -40,6 +40,12 @@
 //!   `pgbearer_pool_acquire_timeouts_total`, `pgbearer_backend_connects_total`,
 //!   `pgbearer_backend_connect_errors_total`.
 
+// Some public items are still `todo!()` stubs (issue #5); remove this
+// allowance in the commit that implements the crate.
+#![allow(clippy::todo)]
+// `PoolError` is reworked (boxed) together with the implementation.
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

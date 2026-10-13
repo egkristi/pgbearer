@@ -26,16 +26,16 @@ print_stdout = "warn"
 
 [workspace.dependencies]
 # Internal crates
-pgbearer-core = { path = "crates/pgbearer-core" }
-pgbearer-config = { path = "crates/pgbearer-config" }
-pgbearer-wire = { path = "crates/pgbearer-wire" }
-pgbearer-tls = { path = "crates/pgbearer-tls" }
-pgbearer-auth = { path = "crates/pgbearer-auth" }
-pgbearer-policy = { path = "crates/pgbearer-policy" }
-pgbearer-audit = { path = "crates/pgbearer-audit" }
-pgbearer-telemetry = { path = "crates/pgbearer-telemetry" }
-pgbearer-pool = { path = "crates/pgbearer-pool" }
-pgbearer-session = { path = "crates/pgbearer-session" }
+pgbearer-core = { path = "crates/pgbearer-core", version = "0.1.0" }
+pgbearer-config = { path = "crates/pgbearer-config", version = "0.1.0" }
+pgbearer-wire = { path = "crates/pgbearer-wire", version = "0.1.0" }
+pgbearer-tls = { path = "crates/pgbearer-tls", version = "0.1.0" }
+pgbearer-auth = { path = "crates/pgbearer-auth", version = "0.1.0" }
+pgbearer-policy = { path = "crates/pgbearer-policy", version = "0.1.0" }
+pgbearer-audit = { path = "crates/pgbearer-audit", version = "0.1.0" }
+pgbearer-telemetry = { path = "crates/pgbearer-telemetry", version = "0.1.0" }
+pgbearer-pool = { path = "crates/pgbearer-pool", version = "0.1.0" }
+pgbearer-session = { path = "crates/pgbearer-session", version = "0.1.0" }
 
 # Async runtime and I/O
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }

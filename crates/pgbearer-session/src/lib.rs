@@ -56,6 +56,10 @@
 //! Transaction pooling is not implemented yet: grants with `pool_mode:
 //! transaction` run in session mode with a warning logged once.
 
+// Some public items are still `todo!()` stubs (issue #5); remove this
+// allowance in the commit that implements the crate.
+#![allow(clippy::todo)]
+
 pub mod cancel;
 pub mod drain;
 pub mod routing;

@@ -196,14 +196,18 @@ review.
 - [x] Rename the GitHub repository to
       [`egkristi/pgbearer`](https://github.com/egkristi/pgbearer)
       ([decision D2](#11-decisions)).
-- [ ] Pinned `rust-toolchain.toml`, an MSRV job, SHA-pinned actions with
-      Renovate or Dependabot, minimal workflow permissions, untrusted PR jobs
-      without secrets.
+- [x] CI toolchain pinned (1.97.0) with a non-blocking latest-stable job;
+      minimal workflow permissions; checkout without persisted credentials.
+- [x] Security scanning: CodeQL (Rust, Actions), cargo-deny, dependency
+      review, Trivy (dependencies, IaC, secrets, image), zizmor, TruffleHog,
+      OpenSSF Scorecard; Dependabot for crates, actions and images.
+- [ ] `rust-toolchain.toml` for local development, an MSRV job, and
+      SHA-pinned actions.
 - [x] CI baseline PostgreSQL 16/17/18; drop 14
       ([decision D8](#11-decisions)).
 - [ ] Non-blocking PostgreSQL 19 beta job.
-- [ ] `SECURITY.md` (disclosure process), `CONTRIBUTING.md`, issue and PR
-      templates.
+- [x] `SECURITY.md` (private disclosure, response times, scanning).
+- [ ] `CONTRIBUTING.md`, issue and PR templates.
 - [ ] `docs/adr/` with template; ADR-001 … ADR-004 recorded; ADR-005 and
       ADR-014 … ADR-019 accepted ([ADR backlog](#12-adr-backlog)).
 - [ ] Threat model v0 (`docs/threat-model.md`), starting from the audit's
