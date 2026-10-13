@@ -67,6 +67,9 @@ pub struct Identity {
     pub expires_at: SystemTime,
     /// Token identifier (`jti` or `uti`), if present.
     pub token_id: Option<String>,
+    /// `kid` of the signing key that verified the token, if it has one. Used
+    /// in audit records and for key-purge revocation (`revoked_key_ids`).
+    pub key_id: Option<String>,
     /// True when the IdP signalled that the groups claim was omitted because
     /// the user is in too many groups (Entra ID "groups overage").
     pub groups_overage: bool,
@@ -438,6 +441,7 @@ mod tests {
             kind: IdentityKind::Human,
             expires_at: SystemTime::UNIX_EPOCH,
             token_id: None,
+            key_id: None,
             groups_overage: false,
             claims: claims.as_object().cloned().unwrap_or_default(),
         }

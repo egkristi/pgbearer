@@ -66,6 +66,18 @@ dates.
   (sent as backend startup parameters), `backends[].cancel_endpoint`,
   `pool.reuse` (rejected until Phase 3a), `revocation.hard_timeout` (60 s) and
   `session.token_expiry_hard_timeout` (120 s).
+- Entra ID token profiles (`token_profiles`): a token must match exactly one
+  enabled profile, `delegated` (user tokens with `scp`) or `application`
+  (app-only tokens with `idtyp: app` and app roles). Each profile fixes the
+  identity kind and whether `required_scopes` applies.
+- `identity_kind` declares whether a generic OIDC provider's tokens belong to
+  people or workloads.
+- `max_token_lifetime` per identity provider (default 24 hours, 1 hour for
+  GitHub Actions, at most 7 days) bounds how long a stolen token can be
+  replayed, even when the IdP issues long-lived tokens.
+- `revoked_key_ids` per identity provider: tokens signed with a listed key are
+  rejected at once, even while the IdP still publishes it.
+- `Identity.key_id` records the `kid` of the key that verified the token.
 - Interface contracts, not yet implemented, for the backend pool (connect,
   role inspection, leases, generations, cancel targets) and the session
   building blocks (startup profile, relay state, cancel registry, admission
@@ -88,6 +100,9 @@ dates.
   role risk.
 - CloudNativePG backends verify the TLS server name
   `<cluster>-<service>.<namespace>.svc` by default.
+- Identity kinds are attested, never guessed: a generic OIDC token is
+  `unknown` unless the provider sets `identity_kind` (a `scope` claim no
+  longer makes it `human`), and an Entra token's kind comes from its profile.
 - The GitHub Actions preset uses the immutable `repository_owner_id` as the
   tenant.
 - The Helm chart mounts the configuration as a directory so hot reload works,
@@ -119,6 +134,12 @@ dates.
 ### Security
 
 - `pool_mode: transaction` requires `experimental.transaction_pooling`.
+- Entra tokens with a `nonce` claim (ID tokens) are rejected, and an
+  identity provider's audience may not also be one of its
+  `allowed_client_ids` (the client's own ID tokens would carry it).
+- Discovery and JWKS requests follow redirects only within the same origin,
+  so a redirect can neither send the bearer token elsewhere nor substitute
+  another host's keys.
 - Deny rules fail closed on unknown claims. A grant, or a deny rule without
   `on_unknown: ignore`, that tests groups, roles or scopes on a provider that
   does not map them is a configuration error.

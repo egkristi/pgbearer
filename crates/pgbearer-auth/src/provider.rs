@@ -14,6 +14,10 @@
 //!   below `min_refresh_interval`), with exponential backoff after failures.
 //! * A failed or empty fetch never replaces a good key set. A key set older
 //!   than `jwks.max_stale` whose last refresh failed is no longer used.
+//! * Keys listed in `revoked_key_ids` are dropped from every fetched or
+//!   installed key set, so they can verify no token, with or without `kid`.
+//! * Redirects are followed only to the same origin, at most
+//!   [`MAX_REDIRECTS`] times.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,10 +34,12 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::claims::ClaimRules;
-use crate::jwks::{KeySet, parse_cache_control, parse_jwks};
+use crate::jwks::{KeySet, ParsedJwks, parse_cache_control, parse_jwks};
 
 /// Maximum size of a discovery or JWKS response body.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Most redirects followed for one discovery or JWKS request.
+pub(crate) const MAX_REDIRECTS: usize = 5;
 /// Largest accepted `leeway`; larger values are a configuration error.
 pub(crate) const MAX_LEEWAY: Duration = Duration::from_secs(24 * 3600);
 /// Shortest delay between scheduled refreshes (guards against busy loops).
@@ -70,6 +76,10 @@ pub(crate) struct Provider {
     pub(crate) algorithms: Vec<Algorithm>,
     /// Clock-skew leeway in seconds.
     pub(crate) leeway_secs: u64,
+    /// Longest accepted token lifetime in seconds.
+    pub(crate) max_token_lifetime_secs: u64,
+    /// Key ids that must not verify tokens.
+    revoked_key_ids: Vec<String>,
     /// Whether readiness depends on this provider.
     pub(crate) required: bool,
     /// Scope for OAUTHBEARER discovery, if configured.
@@ -115,6 +125,26 @@ fn parse_url(value: &str, allow_http: bool, what: &str) -> Result<Url, String> {
     let url = Url::parse(value).map_err(|e| format!("{what} {value:?} is not a valid URL: {e}"))?;
     check_scheme(&url, allow_http, what)?;
     Ok(url)
+}
+
+/// The redirect policy for discovery and JWKS requests: same origin
+/// (scheme, host, port) as the original request, at most [`MAX_REDIRECTS`]
+/// hops. A cross-origin redirect could send the bearer token to another host
+/// or substitute another host's keys.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if same_origin {
+            attempt.follow()
+        } else {
+            attempt.error("redirect to another origin refused")
+        }
+    })
 }
 
 fn map_algorithm(a: JwtAlgorithm) -> Algorithm {
@@ -227,12 +257,16 @@ impl Provider {
         if cfg.kind == IdpType::Entra && cfg.tenants.is_empty() {
             return Err("type entra requires tenants (the allowed tid values)".into());
         }
+        let max_token_lifetime = cfg.effective_max_token_lifetime();
+        if max_token_lifetime.is_zero() {
+            return Err("max_token_lifetime must be greater than zero".into());
+        }
 
         let mut builder = reqwest::Client::builder()
             .timeout(cfg.jwks.http_timeout)
             .connect_timeout(cfg.jwks.http_timeout)
             .user_agent(concat!("pgbearer/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(redirect_policy())
             .https_only(!allow_http)
             .tls_version_min(reqwest::tls::Version::TLS_1_2);
         if let Some(path) = &cfg.ca_file {
@@ -262,6 +296,8 @@ impl Provider {
             audiences: cfg.audiences.clone(),
             algorithms,
             leeway_secs: cfg.leeway.as_secs(),
+            max_token_lifetime_secs: max_token_lifetime.as_secs(),
+            revoked_key_ids: cfg.revoked_key_ids.clone(),
             required: cfg.required,
             oauthbearer_scope: cfg.oauthbearer.as_ref().map(|o| o.scope.clone()),
             openid_configuration_url,
@@ -282,6 +318,27 @@ impl Provider {
     /// Provider name.
     pub(crate) fn name(&self) -> &str {
         &self.rules.name
+    }
+
+    /// Whether `kid` is listed in `revoked_key_ids`.
+    pub(crate) fn is_revoked(&self, kid: &str) -> bool {
+        self.revoked_key_ids.iter().any(|r| r == kid)
+    }
+
+    /// Drop revoked keys from a parsed key set, recording them as skipped.
+    fn drop_revoked(&self, parsed: &mut ParsedJwks) {
+        if self.revoked_key_ids.is_empty() {
+            return;
+        }
+        let mut revoked = Vec::new();
+        parsed.keys.retain(|k| match k.kid.as_deref() {
+            Some(kid) if self.is_revoked(kid) => {
+                revoked.push(format!("key {kid:?} is revoked (revoked_key_ids)"));
+                false
+            }
+            _ => true,
+        });
+        parsed.skipped.extend(revoked);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, FetchState> {
@@ -328,7 +385,8 @@ impl Provider {
 
     /// Install a key set parsed from a JWKS document (no network).
     pub(crate) fn install_jwks(&self, body: &[u8]) -> Result<usize, String> {
-        let parsed = parse_jwks(body)?;
+        let mut parsed = parse_jwks(body)?;
+        self.drop_revoked(&mut parsed);
         if parsed.keys.is_empty() {
             return Err(format!(
                 "JWKS contains no usable signing keys ({} skipped: {})",
@@ -452,7 +510,8 @@ impl Provider {
             }
         };
         let fetched = self.get(&jwks_uri).await.and_then(|(body, cache_max_age)| {
-            let parsed = parse_jwks(&body).map_err(|e| format!("{jwks_uri}: {e}"))?;
+            let mut parsed = parse_jwks(&body).map_err(|e| format!("{jwks_uri}: {e}"))?;
+            self.drop_revoked(&mut parsed);
             if parsed.keys.is_empty() {
                 return Err(format!(
                     "JWKS at {jwks_uri} contains no usable signing keys ({} skipped{}{})",

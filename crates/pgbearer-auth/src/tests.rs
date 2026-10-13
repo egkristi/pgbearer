@@ -98,8 +98,10 @@ async fn es256_token_maps_oidc_identity() {
     assert_eq!(id.roles, ["reader".to_string()].into());
     assert_eq!(id.scopes, ["db.connect", "openid"].map(String::from).into());
     assert_eq!(id.client_id.as_deref(), Some("cli"));
-    assert_eq!(id.kind, IdentityKind::Human);
+    // Generic OIDC: the kind comes from identity_kind, not from a scope claim.
+    assert_eq!(id.kind, IdentityKind::Unknown);
     assert_eq!(id.token_id.as_deref(), Some("tok-1"));
+    assert_eq!(id.key_id, Some(idp.current_kid()));
     assert_eq!(id.expires_at, UNIX_EPOCH + Duration::from_secs(exp));
     assert!(!id.groups_overage);
     assert_eq!(id.claim("custom.nested"), Some(&json!(true)));
@@ -152,12 +154,30 @@ async fn entra_user_and_app_tokens() {
     assert_eq!(id.client_id.as_deref(), Some("app-client"));
     assert!(id.scopes.is_empty());
 
-    // A token without scp that does not say it is app-only must carry the scope.
+    // A token without scp that does not say it is app-only matches no profile.
     let no_scope = idp.mint(json!({"aud": "pgbearer", "oid": "x", "tid": "tenant-1"}));
+    let err = s.v.validate(&no_scope).await.unwrap_err();
+    assert!(matches!(err, AuthError::TokenProfile(_)), "{err:?}");
+    assert_eq!(err.reason_code(), "token_profile");
+
+    // A delegated token must still carry the required scope.
+    let wrong_scope = idp.mint(json!({
+        "aud": "pgbearer", "oid": "x", "tid": "tenant-1", "scp": "Other"
+    }));
     assert_eq!(
-        s.v.validate(&no_scope).await.unwrap_err(),
+        s.v.validate(&wrong_scope).await.unwrap_err(),
         AuthError::MissingScope("Database.Connect".into())
     );
+
+    // ID tokens (nonce) are refused even with the right audience and scope.
+    let id_token = idp.mint(json!({
+        "aud": "pgbearer", "oid": "oid-1", "tid": "tenant-1",
+        "scp": "Database.Connect", "nonce": "n-1"
+    }));
+    assert!(matches!(
+        s.v.validate(&id_token).await.unwrap_err(),
+        AuthError::TokenProfile(_)
+    ));
 }
 
 #[tokio::test]
@@ -1379,6 +1399,10 @@ fn construction_needs_no_runtime_or_network() {
         claims: Default::default(),
         tenants: vec!["tenant-id".into()],
         required_scopes: vec!["Database.Connect".into()],
+        token_profiles: vec![],
+        identity_kind: None,
+        max_token_lifetime: None,
+        revoked_key_ids: vec![],
         required_claims: vec![],
         allowed_client_ids: vec![],
         expected_typ: None,
@@ -1518,4 +1542,194 @@ mod fuzz {
             });
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Token lifetime, revoked keys, redirects
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn token_lifetime_is_capped() {
+    let idp = MockIssuer::start().await;
+    let mut cfg = idp.provider_config("p");
+    cfg.max_token_lifetime = Some(Duration::from_secs(3600));
+    let s = start(&[cfg]).await;
+    let mint = |iat: Value, exp: u64| {
+        idp.mint(json!({"sub": "a", "aud": "pgbearer", "iat": iat, "exp": exp}))
+    };
+    let t = now();
+    // With iat: exp - iat, plus the 60 s leeway.
+    assert!(s.v.validate(&mint(json!(t), t + 3600 + 60)).await.is_ok());
+    let err =
+        s.v.validate(&mint(json!(t), t + 3600 + 61))
+            .await
+            .unwrap_err();
+    assert_eq!(
+        err,
+        AuthError::TokenLifetime {
+            lifetime_secs: 3661,
+            max_secs: 3600
+        }
+    );
+    assert_eq!(err.reason_code(), "token_lifetime");
+    // An old iat counts: the token was issued for longer than allowed.
+    assert!(s.v.validate(&mint(json!(t - 7200), t + 600)).await.is_err());
+    // Without iat: exp - now.
+    assert!(s.v.validate(&mint(Value::Null, t + 1800)).await.is_ok());
+    assert!(matches!(
+        s.v.validate(&mint(Value::Null, t + 7200))
+            .await
+            .unwrap_err(),
+        AuthError::TokenLifetime { .. }
+    ));
+}
+
+#[tokio::test]
+async fn token_lifetime_defaults_by_provider_type() {
+    let idp = MockIssuer::start().await;
+    let s = start(&[idp.provider_config("p")]).await;
+    let t = now();
+    let long = |hours: u64| {
+        idp.mint(json!({"sub": "a", "aud": "pgbearer", "iat": t, "exp": t + hours * 3600}))
+    };
+    // Generic providers: 24 hours.
+    assert!(s.v.validate(&long(24)).await.is_ok());
+    assert!(matches!(
+        s.v.validate(&long(25)).await.unwrap_err(),
+        AuthError::TokenLifetime { .. }
+    ));
+    drop(s);
+    // GitHub Actions: 1 hour.
+    let mut cfg = idp.provider_config("gh");
+    cfg.kind = IdpType::GithubActions;
+    let s = start(&[cfg]).await;
+    let gh = |secs: u64| {
+        idp.mint(
+            json!({"sub": "repo:o/r:ref:refs/heads/main", "aud": "pgbearer",
+                        "iat": t, "exp": t + secs, "repository_owner_id": "1"}),
+        )
+    };
+    assert!(s.v.validate(&gh(3600)).await.is_ok());
+    assert!(matches!(
+        s.v.validate(&gh(2 * 3600)).await.unwrap_err(),
+        AuthError::TokenLifetime { .. }
+    ));
+}
+
+#[tokio::test]
+async fn revoked_keys_verify_nothing() {
+    let idp = MockIssuer::start().await;
+    let mut cfg = idp.provider_config("p");
+    cfg.revoked_key_ids = vec![idp.rsa_kid()];
+    let s = start(&[cfg]).await;
+    assert_eq!(s.v.status()[0].keys, 1, "the revoked key is not loaded");
+    let jwks_requests = idp.jwks_request_count();
+
+    let revoked = idp.mint_with(user_claims("a"), &MintOptions::rsa());
+    let err = s.v.validate(&revoked).await.unwrap_err();
+    assert_eq!(err, AuthError::RevokedKey(idp.rsa_kid()));
+    assert_eq!(err.reason_code(), "revoked_key");
+    assert_eq!(
+        idp.jwks_request_count(),
+        jwks_requests,
+        "a revoked kid triggers no refresh"
+    );
+
+    // Without kid, the revoked key is not a candidate either.
+    let revoked_no_kid = idp.mint_with(user_claims("a"), &MintOptions::rsa().without_kid());
+    assert!(s.v.validate(&revoked_no_kid).await.is_err());
+    // The remaining key is the only one, so a token without kid uses it, and
+    // the identity names it.
+    let ec_no_kid = idp.mint_with(user_claims("b"), &MintOptions::default().without_kid());
+    let id = s.v.validate(&ec_no_kid).await.unwrap();
+    assert_eq!(id.key_id, Some(idp.current_kid()));
+}
+
+#[tokio::test]
+async fn revoking_every_key_makes_the_provider_unavailable() {
+    let idp = MockIssuer::start().await;
+    idp.set_publish_rsa(false);
+    let mut cfg = idp.provider_config("p");
+    cfg.revoked_key_ids = vec![idp.current_kid()];
+    let s = start(&[cfg]).await;
+    assert!(!s.v.is_ready());
+    let err = s.v.status()[0].last_error.clone().unwrap();
+    assert!(err.contains("revoked"), "{err}");
+    let t = idp.mint_with(user_claims("a"), &MintOptions::default().without_kid());
+    assert_eq!(
+        s.v.validate(&t).await.unwrap_err(),
+        AuthError::KeysUnavailable("p".into())
+    );
+}
+
+/// A server on its own port: `/same` redirects to `/keys` on itself, which
+/// serves `jwks`; `/other` redirects to `target` (another origin).
+async fn redirect_server(jwks: Value, target: String) -> (String, CancellationToken) {
+    use axum::http::{StatusCode, header::LOCATION};
+    use axum::routing::get;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let body = jwks.to_string();
+    let app = axum::Router::new()
+        .route(
+            "/same",
+            get(|| async { (StatusCode::FOUND, [(LOCATION, "/keys")]) }),
+        )
+        .route("/keys", get(move || async move { body }))
+        .route(
+            "/other",
+            get(move || async move { (StatusCode::FOUND, [(LOCATION, target)]) }),
+        )
+        .route(
+            "/loop",
+            get(|| async { (StatusCode::FOUND, [(LOCATION, "/loop")]) }),
+        );
+    let stop = CancellationToken::new();
+    let guard = stop.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { guard.cancelled().await })
+            .await;
+    });
+    (base, stop)
+}
+
+#[tokio::test]
+async fn redirects_stay_within_the_origin() {
+    let idp = MockIssuer::start().await;
+    let (base, stop) = redirect_server(idp.jwks(), idp.jwks_url()).await;
+    let with_jwks_uri = |path: &str| {
+        let mut cfg = idp.provider_config("p");
+        cfg.jwks_uri = Some(format!("{base}{path}"));
+        cfg
+    };
+
+    let s = start(&[with_jwks_uri("/same")]).await;
+    assert!(s.v.is_ready(), "{:?}", s.v.status());
+    assert_eq!(
+        s.v.validate(&idp.mint(user_claims("a")))
+            .await
+            .unwrap()
+            .subject,
+        "a"
+    );
+    drop(s);
+
+    let requests = idp.jwks_request_count();
+    let s = start(&[with_jwks_uri("/other")]).await;
+    assert!(!s.v.is_ready());
+    let err = s.v.status()[0].last_error.clone().unwrap();
+    assert!(err.contains("another origin"), "{err}");
+    assert_eq!(
+        idp.jwks_request_count(),
+        requests,
+        "the redirect was not followed"
+    );
+    drop(s);
+
+    let s = start(&[with_jwks_uri("/loop")]).await;
+    assert!(!s.v.is_ready());
+    let err = s.v.status()[0].last_error.clone().unwrap();
+    assert!(err.contains("too many redirects"), "{err}");
+    stop.cancel();
 }

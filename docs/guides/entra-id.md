@@ -53,19 +53,35 @@ deny:
   - name: no-guests
     when:
       issuer: entra
+      kind: human
       claims: [{ name: acct, equals: 1 }]
 ```
 
 pgbearer uses `oid` as the subject (immutable) and `preferred_username` only
-for display and audit. App-only tokens (`idtyp: app`) are classified as
-workloads and are exempt from `required_scopes`, because they carry app
-`roles` instead of scopes. An app-only token without `idtyp` has no scopes and
-is rejected, so enable the optional claim before onboarding workloads.
+for display and audit. Every token must match exactly one of the provider's
+`token_profiles` (default: both):
 
-The guest deny only works when `acct` is actually emitted. Until three-valued
-policy evaluation lands (PLAN Phase 2), a token without `acct` simply does not
-match the deny rule; afterwards such a rule fires on a missing claim unless it
-sets `on_unknown: ignore`.
+* **`delegated`** (a signed-in user): a non-empty `scp` claim, and `idtyp`
+  absent or `user`. `required_scopes` applies, so it must name the API's
+  delegated permission (`Database.Connect`). Kind: human.
+* **`application`** (client credentials, managed identities): `idtyp: app`,
+  no `scp`, and at least one app role in `roles`. `required_scopes` does not
+  apply. Kind: workload. An app-only token without `idtyp` matches neither
+  profile and is rejected, so enable the optional claim before onboarding
+  workloads.
+
+Set `token_profiles: [delegated]` if workloads must not use this provider.
+ID tokens (they carry a `nonce` claim) are always rejected, and tokens may live
+at most `max_token_lifetime` (default 24 h).
+
+Deny rules fail closed: a user token without `acct` matches `no-guests` (the
+claim is unknown) unless the rule sets `on_unknown: ignore`, so enable the
+optional claim first. `kind: human` keeps the rule away from app-only tokens,
+which never carry `acct`. If the provider accepts only people
+(`token_profiles: [delegated]`), you can instead list `acct` in
+`required_claims`, so tokens without it are rejected at login with a clear
+reason (this is what [the example configuration](../../deploy/examples/pgbearer.yaml)
+does).
 
 ## 3. Connect as a person
 

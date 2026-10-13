@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crate::{
     API_VERSION, BackendConfig, BackendTlsMode, ClientAuthMethod, Config, IdentityProviderConfig,
-    IdpType, KIND, LoginMethod, PoolMode, PoolReuse, Predicate, ProxyProtocolMode, RoleRisk,
-    UnknownHandling,
+    IdpType, KIND, LoginMethod, MAX_TOKEN_LIFETIME_LIMIT, PoolMode, PoolReuse, Predicate,
+    ProxyProtocolMode, RoleRisk, TokenProfile, UnknownHandling,
 };
 
 /// Collect every validation problem in `config`.
@@ -350,6 +350,68 @@ impl Validator {
         for name in &p.required_claims {
             if let Err(e) = pgbearer_core::validate_claim_name(name) {
                 self.err(format!("{ctx}: required_claims: {e}"));
+            }
+        }
+        // The public client must be a separate app registration: when it is
+        // also an accepted audience, its own ID tokens (aud = client id)
+        // would pass audience validation.
+        for a in &p.audiences {
+            if p.allowed_client_ids.iter().any(|c| c.trim() == a.trim()) {
+                self.err(format!(
+                    "{ctx}: audience {a:?} is also in allowed_client_ids; the client must be a \
+                     separate registration from the API (its ID tokens carry its own client id \
+                     as audience)"
+                ));
+            }
+        }
+        if !p.token_profiles.is_empty() && p.kind != IdpType::Entra {
+            self.err(format!(
+                "{ctx}: token_profiles is only valid for type entra"
+            ));
+        }
+        let mut seen_profiles = BTreeSet::new();
+        for profile in &p.token_profiles {
+            if !seen_profiles.insert(*profile) {
+                self.err(format!(
+                    "{ctx}: token_profiles lists {:?} more than once",
+                    profile.as_str()
+                ));
+            }
+        }
+        if p.kind == IdpType::Entra
+            && p.effective_token_profiles()
+                .contains(&TokenProfile::Delegated)
+            && p.required_scopes.is_empty()
+        {
+            self.err(format!(
+                "{ctx}: the delegated token profile requires required_scopes (the API's \
+                 delegated permission, for example Database.Connect); without it, a user token \
+                 issued to this API for any purpose would be accepted"
+            ));
+        }
+        if p.identity_kind.is_some() && p.kind != IdpType::Oidc {
+            self.err(format!(
+                "{ctx}: identity_kind is only valid for type oidc (the other types determine it)"
+            ));
+        }
+        if let Some(max) = p.max_token_lifetime
+            && (max.is_zero() || max > MAX_TOKEN_LIFETIME_LIMIT)
+        {
+            self.err(format!(
+                "{ctx}: max_token_lifetime must be greater than zero and at most {}",
+                humantime::format_duration(MAX_TOKEN_LIFETIME_LIMIT)
+            ));
+        }
+        let mut seen_kids = BTreeSet::new();
+        for kid in &p.revoked_key_ids {
+            if kid.is_empty() {
+                self.err(format!(
+                    "{ctx}: revoked_key_ids must not contain empty strings"
+                ));
+            } else if !seen_kids.insert(kid.as_str()) {
+                self.err(format!(
+                    "{ctx}: revoked_key_ids lists {kid:?} more than once"
+                ));
             }
         }
         if p.kind == IdpType::Kubernetes {

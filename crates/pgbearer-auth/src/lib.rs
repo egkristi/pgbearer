@@ -10,8 +10,11 @@
 //!    rejected (no JWS extensions are understood).
 //! 3. Decode the payload *without* verifying, read `iss`, and select the
 //!    provider whose effective issuer equals `iss` **exactly**. Unknown
-//!    issuer → [`AuthError::UnknownIssuer`] with no network call.
-//! 4. Look up the key by `kid` in that provider's JWKS cache. Unknown `kid` →
+//!    issuer → [`AuthError::UnknownIssuer`] with no network call. A `kid` in
+//!    the provider's `revoked_key_ids` → [`AuthError::RevokedKey`], also
+//!    without a network call.
+//! 4. Look up the key by `kid` in that provider's JWKS cache (revoked keys
+//!    are never loaded into it). Unknown `kid` →
 //!    one rate-limited, single-flight refresh (at most once per
 //!    `jwks.min_refresh_interval`), then retry; still unknown →
 //!    [`AuthError::UnknownKey`]. A token without `kid` is accepted only when
@@ -20,20 +23,27 @@
 //!    `x5u`, `jwk`, `x5c` are ignored).
 //! 5. Verify the signature and the claims: `iss` (exact), `aud` (any of the
 //!    configured audiences), `exp` (required), `nbf` and `iat` if present, all
-//!    with `leeway`; optional `typ` check (case-insensitive, an
-//!    `application/` prefix is ignored); tenant in `tenants`;
-//!    `allowed_client_ids` (checked against `azp`, `appid` or `client_id`);
-//!    `required_scopes` ⊆ scopes. Required scopes apply to every token except
-//!    Entra app-only tokens (`idtyp=app`; enable the `idtyp` optional claim in
-//!    the app registration) and tokens from `kubernetes` and `github-actions`
-//!    providers, which carry no scopes.
+//!    with `leeway`; the token lifetime (`exp - iat`, or `exp - now` without
+//!    `iat`) at most `max_token_lifetime` + `leeway`, else
+//!    [`AuthError::TokenLifetime`]; optional `typ` check (case-insensitive, an
+//!    `application/` prefix is ignored); `required_claims` present and not
+//!    `null`; tenant in `tenants`; `allowed_client_ids` (checked against
+//!    `azp`, `appid` or `client_id`). For `type: entra`, a token with a
+//!    `nonce` claim (an ID token) is rejected, and the token must match
+//!    exactly one enabled token profile (`delegated`: non-empty `scp`,
+//!    `idtyp` absent or `user`; `application`: `idtyp=app`, no `scp`,
+//!    non-empty `roles`), else [`AuthError::TokenProfile`]. Finally
+//!    `required_scopes` ⊆ scopes, for every token except Entra application
+//!    tokens and tokens from `kubernetes` and `github-actions` providers,
+//!    which carry no scopes.
 //! 6. Map claims to an [`Identity`] with the provider's effective claim names
 //!    (dotted paths allowed, but a claim whose literal name matches wins;
 //!    string or array values; scopes split on whitespace). `kind` is
-//!    `Workload` for Entra `idtyp=app`, Kubernetes and GitHub Actions tokens,
-//!    `Human` for Entra `idtyp=user` and for tokens with a `scp`/`scope`
-//!    claim, else `Unknown`. Groups overage (`_claim_names.groups` or
-//!    `hasgroups`) sets `groups_overage`.
+//!    `Workload` for Kubernetes, GitHub Actions and Entra application tokens,
+//!    `Human` for Entra delegated tokens, the configured `identity_kind` for
+//!    `type: oidc`, else `Unknown`. `key_id` is the `kid` of the verifying
+//!    key. Groups overage (`_claim_names.groups` or `hasgroups`) sets
+//!    `groups_overage`.
 //!
 //! JWKS cache (§8.3): initial discovery + fetch in [`TokenValidator::start`];
 //! background refresh at `max_age`, sooner when `Cache-Control: max-age` is
@@ -48,7 +58,10 @@
 //!
 //! HTTP: `reqwest` with rustls, `jwks.http_timeout`, https only (unless
 //! `insecure_allow_http`), responses capped at 1 MiB, optional extra CA
-//! (`ca_file`) and bearer token (`bearer_token_file`, re-read on each request).
+//! (`ca_file`) and bearer token (`bearer_token_file`, re-read on each
+//! request). Redirects are followed only within the same origin (scheme,
+//! host and port), at most 5 hops, so a redirect can neither leak the bearer
+//! token to another host nor substitute another host's keys.
 //!
 //! Metrics: `pgbearer_auth_attempts_total`, `pgbearer_auth_duration_seconds`,
 //! `pgbearer_jwks_refresh_total`, `pgbearer_jwks_age_seconds`.
@@ -134,6 +147,21 @@ pub enum AuthError {
     /// `typ` header mismatch.
     #[error("unexpected token type {0:?}")]
     BadType(String),
+    /// The token does not match an enabled token profile (Entra ID), or is an
+    /// ID token.
+    #[error("token profile not accepted: {0}")]
+    TokenProfile(String),
+    /// The token's lifetime is longer than `max_token_lifetime`.
+    #[error("token lifetime of {lifetime_secs}s exceeds the maximum of {max_secs}s")]
+    TokenLifetime {
+        /// `exp - iat`, or `exp - now` for a token without `iat`.
+        lifetime_secs: u64,
+        /// `max_token_lifetime` in seconds.
+        max_secs: u64,
+    },
+    /// The token was signed with a key listed in `revoked_key_ids`.
+    #[error("signing key {0:?} is revoked")]
+    RevokedKey(String),
 }
 
 impl AuthError {
@@ -154,6 +182,9 @@ impl AuthError {
             AuthError::MissingScope(_) => "missing_scope",
             AuthError::ClientNotAllowed(_) => "client_not_allowed",
             AuthError::BadType(_) => "bad_type",
+            AuthError::TokenProfile(_) => "token_profile",
+            AuthError::TokenLifetime { .. } => "token_lifetime",
+            AuthError::RevokedKey(_) => "revoked_key",
         }
     }
 }
@@ -498,6 +529,11 @@ impl TokenValidator {
                 AuthError::DisallowedAlgorithm(alg_name(parsed.alg).into()),
             ));
         }
+        if let Some(kid) = parsed.kid.as_deref()
+            && provider.is_revoked(kid)
+        {
+            return Err((Some(provider), AuthError::RevokedKey(sanitize(kid))));
+        }
         Ok(Selected {
             token,
             parsed,
@@ -550,18 +586,35 @@ impl TokenValidator {
         )
         .map_err(|e| map_jwt_error(&e, alg, &p.rules.issuer))?;
         let claims = data.claims;
-        if let Some(iat) = claims.get("iat") {
-            let iat = numeric_date(iat).ok_or_else(|| AuthError::MissingClaim("iat".into()))?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_secs();
-            if iat > now.saturating_add(p.leeway_secs) {
-                return Err(AuthError::NotYetValid);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let iat = match claims.get("iat") {
+            None => None,
+            Some(iat) => {
+                let iat = numeric_date(iat).ok_or_else(|| AuthError::MissingClaim("iat".into()))?;
+                if iat > now.saturating_add(p.leeway_secs) {
+                    return Err(AuthError::NotYetValid);
+                }
+                Some(iat)
             }
+        };
+        let exp = claims
+            .get("exp")
+            .and_then(numeric_date)
+            .ok_or_else(|| AuthError::MissingClaim("exp".into()))?;
+        let lifetime_secs = exp.saturating_sub(iat.unwrap_or(now));
+        if lifetime_secs > p.max_token_lifetime_secs.saturating_add(p.leeway_secs) {
+            return Err(AuthError::TokenLifetime {
+                lifetime_secs,
+                max_secs: p.max_token_lifetime_secs,
+            });
         }
         claims::check_constraints(&p.rules, s.parsed.typ.as_deref(), &claims)?;
-        claims::map_identity(&p.rules, claims, true)
+        let mut identity = claims::map_identity(&p.rules, claims, true)?;
+        identity.key_id = key.kid.clone();
+        Ok(identity)
     }
 
     fn record(

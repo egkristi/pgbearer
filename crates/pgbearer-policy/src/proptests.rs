@@ -344,6 +344,7 @@ fn identity() -> impl Strategy<Value = Identity> {
                 kind,
                 expires_at: SystemTime::UNIX_EPOCH,
                 token_id: None,
+                key_id: None,
                 groups_overage,
                 claims,
             }

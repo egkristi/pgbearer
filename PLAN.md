@@ -286,15 +286,15 @@ PostgreSQL 16 and 18. No desync under fuzzed sequences. →
 and get the right role on a CNPG cluster: one backend connection per client
 session, bounded revocation, audit evidence.
 
-**`pgbearer-auth`** (implemented, 110 tests)
+**`pgbearer-auth`** (implemented, 119 tests)
 - [x] Issuer registry, exact `iss` selection, discovery with exact issuer
       match, JWKS cache (single-flight, rate-limited, atomic replacement,
       bounded staleness), validation pipeline, claim mapping, presets.
 - [x] Token as password on TLS listeners; OAUTHBEARER server exchange.
-- [ ] Explicit token profiles: Entra `delegated` and `application`; generic
+- [x] Explicit token profiles: Entra `delegated` and `application`; generic
       OIDC kind `Unknown` unless a profile attests it; reject `nonce` (ID
       tokens).
-- [ ] `max_token_lifetime` per provider; same-origin redirects;
+- [x] `max_token_lifetime` per provider; same-origin redirects;
       `revoked_key_ids`; `key_id` on `Identity`.
 - [x] Kubernetes audience validation (reject the API server audience).
 - [x] GitHub preset: tenant `repository_owner_id`.

@@ -27,8 +27,11 @@ identity_providers:
     issuer: "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0"
     audiences: ["11111111-1111-1111-1111-111111111111"]   # the pgbearer API's client ID
     tenants: ["00000000-0000-0000-0000-000000000000"]
+    # People only; workloads use the k8s provider. Add "application" to
+    # accept app-only tokens (they need the optional claim idtyp).
+    token_profiles: [delegated]
     required_scopes: ["Database.Connect"]
-    # Tokens must carry "acct" (enable the optional claim in the app
+    # User tokens must carry "acct" (enable the optional claim in the app
     # registration), so the guest deny rule below is never "unknown".
     required_claims: ["acct"]
   - name: k8s

@@ -1,10 +1,11 @@
-//! Claim constraints (tenant, client, scopes, `typ`) and the mapping from a
-//! claim set to an [`Identity`] (ARCHITECTURE.md §8.2, §8.5, §15.2).
+//! Claim constraints (tenant, client, Entra token profiles, scopes, `typ`)
+//! and the mapping from a claim set to an [`Identity`] (ARCHITECTURE.md §8.2,
+//! §8.5, §15.2).
 
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
-use pgbearer_config::{EffectiveClaims, IdentityProviderConfig, IdpType};
+use pgbearer_config::{EffectiveClaims, IdentityProviderConfig, IdpType, TokenProfile};
 use pgbearer_core::{Identity, IdentityKind};
 use serde_json::{Map, Value};
 
@@ -35,6 +36,10 @@ pub(crate) struct ClaimRules {
     pub(crate) expected_typ: Option<String>,
     /// Claims every token must carry.
     pub(crate) required_claims: Vec<String>,
+    /// Accepted Entra token profiles (empty for other types).
+    pub(crate) token_profiles: Vec<TokenProfile>,
+    /// Declared kind of every token (`type: oidc` only).
+    pub(crate) identity_kind: Option<IdentityKind>,
 }
 
 impl ClaimRules {
@@ -50,6 +55,8 @@ impl ClaimRules {
             allowed_client_ids: cfg.allowed_client_ids.clone(),
             required_claims: cfg.required_claims.clone(),
             expected_typ: cfg.expected_typ.clone(),
+            token_profiles: cfg.effective_token_profiles(),
+            identity_kind: cfg.identity_kind,
         }
     }
 
@@ -111,17 +118,53 @@ fn client_id(rules: &ClaimRules, claims: &Map<String, Value>) -> Option<String> 
         .find_map(|c| string_claim(claims, c))
 }
 
-/// Entra app-only (client-credentials) token: `idtyp == "app"`.
-fn is_entra_app_only(claims: &Map<String, Value>) -> bool {
-    claims.get("idtyp").and_then(Value::as_str) == Some("app")
+/// The Entra token profile a claim set has, if any (see
+/// [`TokenProfile`]). Uses Entra's own claim names (`scp`, `idtyp`, `roles`),
+/// whatever the claim mapping says, because they describe the token's shape.
+fn entra_profile(claims: &Map<String, Value>) -> Option<TokenProfile> {
+    let present = |name: &str| claims.get(name).is_some_and(|v| !v.is_null());
+    let idtyp = match claims.get("idtyp") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        // A malformed idtyp matches no profile.
+        Some(_) => return None,
+    };
+    let has_scopes = !string_set(claims.get("scp"), true).is_empty();
+    let has_roles = !string_set(claims.get("roles"), false).is_empty();
+    match idtyp {
+        None | Some("user") if has_scopes => Some(TokenProfile::Delegated),
+        Some("app") if !present("scp") && has_roles => Some(TokenProfile::Application),
+        _ => None,
+    }
 }
 
 /// Whether `required_scopes` applies to this token.
 fn scopes_enforced(rules: &ClaimRules, claims: &Map<String, Value>) -> bool {
     match rules.kind {
         IdpType::Kubernetes | IdpType::GithubActions => false,
-        IdpType::Entra => !is_entra_app_only(claims),
+        IdpType::Entra => entra_profile(claims) != Some(TokenProfile::Application),
         IdpType::Oidc => true,
+    }
+}
+
+/// Entra only: reject ID tokens and tokens that match no enabled profile.
+fn check_entra_profile(rules: &ClaimRules, claims: &Map<String, Value>) -> Result<(), AuthError> {
+    if claims.contains_key("nonce") {
+        return Err(AuthError::TokenProfile(
+            "ID tokens are not accepted (the token has a nonce claim)".into(),
+        ));
+    }
+    match entra_profile(claims) {
+        Some(profile) if rules.token_profiles.contains(&profile) => Ok(()),
+        Some(profile) => Err(AuthError::TokenProfile(format!(
+            "the {} token profile is not enabled for this provider",
+            profile.as_str()
+        ))),
+        None => Err(AuthError::TokenProfile(
+            "the token matches no enabled token profile (delegated: scp, and idtyp absent or \
+             user; application: idtyp=app, no scp, and roles)"
+                .into(),
+        )),
     }
 }
 
@@ -137,8 +180,8 @@ fn typ_matches(expected: &str, actual: &str) -> bool {
     strip(expected).eq_ignore_ascii_case(strip(actual))
 }
 
-/// Check the provider's constraints on a *verified* token: `typ`, tenant,
-/// client id and required scopes.
+/// Check the provider's constraints on a *verified* token: `typ`, required
+/// claims, tenant, client id, Entra token profiles and required scopes.
 pub(crate) fn check_constraints(
     rules: &ClaimRules,
     typ: Option<&str>,
@@ -179,6 +222,9 @@ pub(crate) fn check_constraints(
             return Err(AuthError::ClientNotAllowed(sanitize(&client)));
         }
     }
+    if rules.kind == IdpType::Entra {
+        check_entra_profile(rules, claims)?;
+    }
     if !rules.required_scopes.is_empty() && scopes_enforced(rules, claims) {
         let have = scopes(rules, claims);
         if let Some(missing) = rules.required_scopes.iter().find(|s| !have.contains(*s)) {
@@ -188,21 +234,16 @@ pub(crate) fn check_constraints(
     Ok(())
 }
 
-fn identity_kind(
-    rules: &ClaimRules,
-    claims: &Map<String, Value>,
-    scopes: &BTreeSet<String>,
-) -> IdentityKind {
+fn identity_kind(rules: &ClaimRules, claims: &Map<String, Value>) -> IdentityKind {
     match rules.kind {
         IdpType::Kubernetes | IdpType::GithubActions => IdentityKind::Workload,
-        IdpType::Entra => match claims.get("idtyp").and_then(Value::as_str) {
-            Some("app") => IdentityKind::Workload,
-            Some("user") => IdentityKind::Human,
-            _ if !scopes.is_empty() => IdentityKind::Human,
-            _ => IdentityKind::Unknown,
+        IdpType::Entra => match entra_profile(claims) {
+            Some(TokenProfile::Delegated) => IdentityKind::Human,
+            Some(TokenProfile::Application) => IdentityKind::Workload,
+            None => IdentityKind::Unknown,
         },
-        IdpType::Oidc if !scopes.is_empty() => IdentityKind::Human,
-        IdpType::Oidc => IdentityKind::Unknown,
+        // A scope claim says nothing reliable about who holds the token.
+        IdpType::Oidc => rules.identity_kind.unwrap_or_default(),
     }
 }
 
@@ -251,7 +292,7 @@ pub(crate) fn map_identity(
         .unwrap_or_default();
     let scopes = scopes(rules, &claims);
     let client_id = client_id(rules, &claims);
-    let kind = identity_kind(rules, &claims, &scopes);
+    let kind = identity_kind(rules, &claims);
     let expires_at = match claims
         .get("exp")
         .and_then(numeric_date)
@@ -276,6 +317,7 @@ pub(crate) fn map_identity(
         kind,
         expires_at,
         token_id,
+        key_id: None,
         groups_overage,
         claims,
     })
@@ -299,6 +341,11 @@ mod tests {
             allowed_client_ids: vec![],
             expected_typ: None,
             required_claims: vec![],
+            token_profiles: match kind {
+                IdpType::Entra => vec![TokenProfile::Delegated, TokenProfile::Application],
+                _ => vec![],
+            },
+            identity_kind: None,
         }
     }
 
@@ -367,8 +414,10 @@ mod tests {
         assert_eq!(id.roles.len(), 2);
         assert_eq!(id.scopes, ["db", "openid"].map(String::from).into());
         assert_eq!(id.client_id.as_deref(), Some("cli"));
-        assert_eq!(id.kind, IdentityKind::Human);
+        // A scope claim does not make a generic OIDC token a human's.
+        assert_eq!(id.kind, IdentityKind::Unknown);
         assert_eq!(id.token_id.as_deref(), Some("j1"));
+        assert_eq!(id.key_id, None);
         assert_eq!(
             id.expires_at,
             SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000)
@@ -401,11 +450,24 @@ mod tests {
     }
 
     #[test]
+    fn oidc_identity_kind_is_declared() {
+        let mut r = rules(IdpType::Oidc);
+        for kind in [IdentityKind::Human, IdentityKind::Workload] {
+            r.identity_kind = Some(kind);
+            let id = map_identity(&r, obj(json!({"sub": "u", "exp": 1})), true).unwrap();
+            assert_eq!(id.kind, kind);
+        }
+    }
+
+    #[test]
     fn entra_kinds_and_client_ids() {
         let r = rules(IdpType::Entra);
         let app = map_identity(
             &r,
-            obj(json!({"oid": "o1", "sub": "s", "idtyp": "app", "appid": "app-1", "tid": "t", "exp": 1})),
+            obj(
+                json!({"oid": "o1", "sub": "s", "idtyp": "app", "roles": ["Db.Connect"],
+                        "appid": "app-1", "tid": "t", "exp": 1}),
+            ),
             true,
         )
         .unwrap();
@@ -423,13 +485,85 @@ mod tests {
         assert_eq!(user.token_id.as_deref(), Some("u"));
         let explicit_user = map_identity(
             &r,
-            obj(json!({"oid": "o3", "idtyp": "user", "exp": 1})),
+            obj(json!({"oid": "o3", "idtyp": "user", "scp": "x", "exp": 1})),
             true,
         )
         .unwrap();
         assert_eq!(explicit_user.kind, IdentityKind::Human);
-        let unknown = map_identity(&r, obj(json!({"oid": "o4", "exp": 1})), true).unwrap();
-        assert_eq!(unknown.kind, IdentityKind::Unknown);
+        // Shapes that match no profile have no kind (and fail validation).
+        for claims in [
+            json!({"oid": "o4", "exp": 1}),
+            json!({"oid": "o5", "idtyp": "user", "exp": 1}),
+            json!({"oid": "o6", "idtyp": "app", "exp": 1}),
+        ] {
+            let id = map_identity(&r, obj(claims), true).unwrap();
+            assert_eq!(id.kind, IdentityKind::Unknown);
+        }
+    }
+
+    #[test]
+    fn entra_profile_classification() {
+        use TokenProfile::{Application as A, Delegated as D};
+        let cases: Vec<(Value, Option<TokenProfile>)> = vec![
+            (json!({"scp": "Database.Connect"}), Some(D)),
+            (json!({"scp": "a b", "idtyp": "user"}), Some(D)),
+            (json!({"scp": ["a"]}), Some(D)),
+            (json!({"scp": "  "}), None),
+            (json!({"scp": ""}), None),
+            (json!({"scp": "a", "idtyp": "app"}), None),
+            (json!({"scp": "a", "idtyp": "device"}), None),
+            (json!({"scp": "a", "idtyp": 1}), None),
+            (json!({"idtyp": "app", "roles": ["R"]}), Some(A)),
+            (json!({"idtyp": "app", "roles": "R"}), Some(A)),
+            (json!({"idtyp": "app", "roles": []}), None),
+            (json!({"idtyp": "app"}), None),
+            (json!({"idtyp": "app", "roles": ["R"], "scp": ""}), None),
+            (
+                json!({"idtyp": "app", "roles": ["R"], "scp": null}),
+                Some(A),
+            ),
+            // Without idtyp an app token cannot be told from a broken one.
+            (json!({"roles": ["R"]}), None),
+            (json!({"idtyp": null, "scp": "a"}), Some(D)),
+            (json!({}), None),
+        ];
+        for (claims, expected) in cases {
+            assert_eq!(entra_profile(&obj(claims.clone())), expected, "{claims}");
+        }
+    }
+
+    #[test]
+    fn entra_profiles_are_enforced() {
+        let mut r = rules(IdpType::Entra);
+        r.required_scopes = vec!["Database.Connect".into()];
+        let delegated = obj(json!({"scp": "Database.Connect"}));
+        let application = obj(json!({"idtyp": "app", "roles": ["R"]}));
+        assert_eq!(check_constraints(&r, None, &delegated), Ok(()));
+        assert_eq!(check_constraints(&r, None, &application), Ok(()));
+        let profile_error = |r: &ClaimRules, c: &Map<String, Value>| {
+            matches!(
+                check_constraints(r, None, c),
+                Err(AuthError::TokenProfile(_))
+            )
+        };
+        assert!(profile_error(&r, &obj(json!({"roles": ["R"]}))));
+        assert!(profile_error(&r, &obj(json!({"idtyp": "user"}))));
+        // ID tokens are refused even when they would otherwise match.
+        assert!(profile_error(
+            &r,
+            &obj(json!({"scp": "Database.Connect", "nonce": "n"}))
+        ));
+        r.token_profiles = vec![TokenProfile::Delegated];
+        assert_eq!(check_constraints(&r, None, &delegated), Ok(()));
+        assert_eq!(
+            check_constraints(&r, None, &application),
+            Err(AuthError::TokenProfile(
+                "the application token profile is not enabled for this provider".into()
+            ))
+        );
+        r.token_profiles = vec![TokenProfile::Application];
+        assert!(profile_error(&r, &delegated));
+        assert_eq!(check_constraints(&r, None, &application), Ok(()));
     }
 
     #[test]
@@ -530,11 +664,11 @@ mod tests {
             c(json!({"tid": "t1", "azp": "c1", "scp": "Other"})),
             Err(AuthError::MissingScope("Database.Connect".into()))
         );
-        // Delegated token without any scope claim still needs the scope.
-        assert_eq!(
+        // A token without any scope claim matches no profile.
+        assert!(matches!(
             c(json!({"tid": "t1", "azp": "c1"})),
-            Err(AuthError::MissingScope("Database.Connect".into()))
-        );
+            Err(AuthError::TokenProfile(_))
+        ));
         // Entra app-only tokens are exempt from required_scopes.
         assert_eq!(
             c(json!({"tid": "t1", "azp": "c1", "idtyp": "app", "roles": ["R"]})),
@@ -564,7 +698,7 @@ mod tests {
 
     #[test]
     fn required_claims_must_be_present() {
-        let mut r = rules(IdpType::Entra);
+        let mut r = rules(IdpType::Oidc);
         r.required_claims = vec!["acct".into(), "/kubernetes.io/pod/uid".into()];
         let ok = obj(json!({"acct": 0, "kubernetes.io": {"pod": {"uid": "u"}}}));
         assert_eq!(check_constraints(&r, None, &ok), Ok(()));

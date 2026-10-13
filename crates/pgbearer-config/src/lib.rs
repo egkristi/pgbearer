@@ -327,6 +327,24 @@ pub struct IdentityProviderConfig {
     /// Scopes that must all be present in delegated (user) tokens.
     #[serde(default)]
     pub required_scopes: Vec<String>,
+    /// `type: entra` only: which token shapes are accepted (default: both).
+    /// See [`TokenProfile`].
+    #[serde(default)]
+    pub token_profiles: Vec<TokenProfile>,
+    /// `type: oidc` only: whether this provider's tokens belong to people or
+    /// to workloads. Unset: [`IdentityKind::Unknown`] (generic OIDC tokens do
+    /// not say reliably).
+    #[serde(default)]
+    pub identity_kind: Option<IdentityKind>,
+    /// Longest accepted token lifetime (`exp - iat`, or `exp - now` when the
+    /// token has no `iat`). Default: 1 hour for `github-actions`, 24 hours
+    /// otherwise; at most 7 days.
+    #[serde(default, with = "duration::option")]
+    pub max_token_lifetime: Option<Duration>,
+    /// Signing key ids (`kid`) that must no longer be accepted, for example
+    /// after a key compromise, even while the IdP still publishes them.
+    #[serde(default)]
+    pub revoked_key_ids: Vec<String>,
     /// Claims every token must carry (same name syntax as policy claim
     /// conditions). A token without one of them is rejected, so policy
     /// conditions on these claims are never *unknown*.
@@ -359,6 +377,26 @@ impl IdentityProviderConfig {
         })
     }
 
+    /// The accepted token profiles: the configured ones, or both for
+    /// `type: entra` when none are configured. Empty for other types.
+    pub fn effective_token_profiles(&self) -> Vec<TokenProfile> {
+        match self.kind {
+            IdpType::Entra if self.token_profiles.is_empty() => {
+                vec![TokenProfile::Delegated, TokenProfile::Application]
+            }
+            IdpType::Entra => self.token_profiles.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The longest accepted token lifetime, applying the per-type default.
+    pub fn effective_max_token_lifetime(&self) -> Duration {
+        self.max_token_lifetime.unwrap_or(match self.kind {
+            IdpType::GithubActions => DEFAULT_MAX_TOKEN_LIFETIME_GITHUB,
+            _ => DEFAULT_MAX_TOKEN_LIFETIME,
+        })
+    }
+
     /// The claim mapping with type-specific defaults filled in.
     pub fn effective_claims(&self) -> EffectiveClaims {
         let d = EffectiveClaims::defaults_for(self.kind);
@@ -371,6 +409,41 @@ impl IdentityProviderConfig {
             scopes: c.scopes.clone().or(d.scopes),
             tenant: c.tenant.clone().or(d.tenant),
             client_id: c.client_id.clone().or(d.client_id),
+        }
+    }
+}
+
+/// Default [`IdentityProviderConfig::max_token_lifetime`].
+pub const DEFAULT_MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 3600);
+/// Default [`IdentityProviderConfig::max_token_lifetime`] for `github-actions`
+/// (GitHub's job tokens live for minutes).
+pub const DEFAULT_MAX_TOKEN_LIFETIME_GITHUB: Duration = Duration::from_secs(3600);
+/// Largest accepted [`IdentityProviderConfig::max_token_lifetime`].
+pub const MAX_TOKEN_LIFETIME_LIMIT: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Entra ID access token shapes (`identity_providers[].token_profiles`).
+///
+/// A token must match exactly one enabled profile:
+/// * `delegated`: a user's token. It has a non-empty `scp` claim, and `idtyp`
+///   is absent or `user`. `required_scopes` applies. Kind: human.
+/// * `application`: an app-only (client credentials) token. `idtyp` is `app`
+///   (enable the `idtyp` optional claim), there is no `scp`, and `roles` is
+///   non-empty. `required_scopes` does not apply. Kind: workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenProfile {
+    /// User tokens (on-behalf-of a signed-in user).
+    Delegated,
+    /// App-only tokens (client credentials).
+    Application,
+}
+
+impl TokenProfile {
+    /// The configuration spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenProfile::Delegated => "delegated",
+            TokenProfile::Application => "application",
         }
     }
 }

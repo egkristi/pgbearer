@@ -436,3 +436,95 @@ fn backend_network_defaults_and_reuse_gate() {
     let p = problems(&yaml);
     assert!(p.iter().any(|m| m.contains("Phase 3a")), "{p:?}");
 }
+
+const MINIMAL_IDP: &str = "  - name: idp\n    issuer: \"https://idp.example.com/realms/main\"\n    audiences: [\"pgbearer\"]\n";
+
+#[test]
+fn token_validation_settings_are_checked() {
+    let yaml = minimal().replace(
+        MINIMAL_IDP,
+        &format!(
+            "{MINIMAL_IDP}    token_profiles: [delegated]\n    max_token_lifetime: 8d\n    \
+             revoked_key_ids: [\"k1\", \"k1\", \"\"]\n    allowed_client_ids: [\"pgbearer\"]\n  \
+             - name: k8s\n    type: kubernetes\n    audiences: [\"pgbearer\"]\n    \
+             identity_kind: human\n    max_token_lifetime: 0s\n"
+        ),
+    );
+    let p = problems(&yaml);
+    for needle in [
+        "token_profiles is only valid for type entra",
+        "identity_kind is only valid for type oidc",
+        "identity_providers[idp]: max_token_lifetime must be greater than zero and at most 7days",
+        "identity_providers[k8s]: max_token_lifetime",
+        "revoked_key_ids lists \"k1\" more than once",
+        "revoked_key_ids must not contain empty strings",
+        "audience \"pgbearer\" is also in allowed_client_ids",
+    ] {
+        assert!(p.iter().any(|m| m.contains(needle)), "{needle}: {p:?}");
+    }
+}
+
+#[test]
+fn token_validation_defaults() {
+    let yaml = minimal().replace(
+        MINIMAL_IDP,
+        &format!(
+            "{MINIMAL_IDP}    identity_kind: workload\n    revoked_key_ids: [\"old\"]\n  \
+             - name: gh\n    type: github-actions\n    audiences: [\"pgbearer\"]\n"
+        ),
+    );
+    let c = Config::from_yaml_str(&yaml).expect("valid config");
+    let idp = &c.identity_providers[0];
+    assert_eq!(idp.identity_kind, Some(IdentityKind::Workload));
+    assert_eq!(idp.revoked_key_ids, ["old"]);
+    assert_eq!(
+        idp.effective_max_token_lifetime(),
+        Duration::from_secs(24 * 3600)
+    );
+    assert!(idp.effective_token_profiles().is_empty());
+    let gh = &c.identity_providers[1];
+    assert_eq!(gh.effective_max_token_lifetime(), Duration::from_secs(3600));
+}
+
+#[test]
+fn entra_token_profiles() {
+    let entra = "  - name: idp\n    type: entra\n    issuer: \"https://login.microsoftonline.com/t1/v2.0\"\n    audiences: [\"api\"]\n    tenants: [\"t1\"]\n";
+    // Both profiles by default; delegated needs required_scopes.
+    let p = problems(&minimal().replace(MINIMAL_IDP, entra));
+    assert!(
+        p.iter()
+            .any(|m| m.contains("delegated token profile requires required_scopes")),
+        "{p:?}"
+    );
+    let c = Config::from_yaml_str(&minimal().replace(
+        MINIMAL_IDP,
+        &format!("{entra}    required_scopes: [\"Database.Connect\"]\n"),
+    ))
+    .expect("valid config");
+    assert_eq!(
+        c.identity_providers[0].effective_token_profiles(),
+        [TokenProfile::Delegated, TokenProfile::Application]
+    );
+    // Application tokens only: no scopes needed.
+    let c = Config::from_yaml_str(&minimal().replace(
+        MINIMAL_IDP,
+        &format!("{entra}    token_profiles: [application]\n"),
+    ))
+    .expect("valid config");
+    assert_eq!(
+        c.identity_providers[0].effective_token_profiles(),
+        [TokenProfile::Application]
+    );
+    let p = problems(&minimal().replace(
+        MINIMAL_IDP,
+        &format!("{entra}    token_profiles: [application, application]\n"),
+    ));
+    assert!(p.iter().any(|m| m.contains("more than once")), "{p:?}");
+    assert!(
+        Config::from_yaml_str(&minimal().replace(
+            MINIMAL_IDP,
+            &format!("{entra}    token_profiles: [service]\n"),
+        ))
+        .is_err()
+    );
+}

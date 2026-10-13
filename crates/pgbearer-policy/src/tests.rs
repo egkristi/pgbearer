@@ -116,6 +116,7 @@ fn alice() -> Identity {
         kind: IdentityKind::Human,
         expires_at: SystemTime::UNIX_EPOCH,
         token_id: None,
+        key_id: None,
         groups_overage: false,
         claims: claims(json!({"acct": 0, "env": "prod", "tags": ["a", "b"]})),
     }
@@ -135,6 +136,7 @@ fn workload() -> Identity {
         kind: IdentityKind::Workload,
         expires_at: SystemTime::UNIX_EPOCH,
         token_id: None,
+        key_id: None,
         groups_overage: false,
         claims: claims(json!({"kubernetes.io": {"namespace": "orders"}})),
     }
@@ -1689,6 +1691,7 @@ fn example_identity(provider: &str, subject: &str, token: Value) -> Identity {
         kind: IdentityKind::Workload,
         expires_at: SystemTime::UNIX_EPOCH,
         token_id: None,
+        key_id: None,
         groups_overage: false,
         claims: claims(token),
     }
