@@ -198,7 +198,7 @@ review.
       ([decision D2](#11-decisions)).
 - [x] CI toolchain pinned (1.97.0) with a non-blocking latest-stable job;
       minimal workflow permissions; checkout without persisted credentials.
-- [x] Security scanning: CodeQL (Rust, Actions), cargo-deny, dependency
+- [x] Security scanning: CodeQL (default setup), cargo-deny, dependency
       review, Trivy (dependencies, IaC, secrets, image), zizmor, TruffleHog,
       OpenSSF Scorecard; Dependabot for crates, actions and images.
 - [ ] `rust-toolchain.toml` for local development, an MSRV job, and

@@ -38,7 +38,7 @@ dates.
   CloudNativePG example and guides for CNPG, Entra ID and local development.
 - Analysis of the external design audit of 9 October 2026
   ([docs/reviews/2026-10-09-audit-response.md](docs/reviews/2026-10-09-audit-response.md)).
-- Security scanning: CodeQL for Rust and GitHub Actions, daily RustSec
+- Security scanning: CodeQL (code scanning default setup), daily RustSec
   advisories, dependency review on pull requests, Trivy (dependencies,
   Dockerfile/Helm/Kubernetes misconfigurations, secrets, container image),
   zizmor, TruffleHog and OpenSSF Scorecard; Dependabot for crates, actions

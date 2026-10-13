@@ -54,7 +54,7 @@ Every push to `main`, every pull request and a daily schedule run:
 
 | Scan | What it covers | Workflow |
 |---|---|---|
-| CodeQL (`security-and-quality`) | Rust source and the GitHub Actions workflows | `codeql.yml` |
+| CodeQL | Rust source and the GitHub Actions workflows | repository code scanning (*default setup*) |
 | cargo-deny | RustSec advisories, licences, banned crates (OpenSSL), sources | `ci.yml`, `security.yml` |
 | Dependency review | New vulnerable dependencies in pull requests | `security.yml` |
 | Trivy | `Cargo.lock` vulnerabilities, Dockerfile/Helm/Kubernetes misconfigurations, committed secrets, and the built container image | `security.yml` |
@@ -64,10 +64,11 @@ Every push to `main`, every pull request and a daily schedule run:
 | Dependabot | Version updates for Rust crates, GitHub Actions and the container base images | `dependabot.yml` |
 
 Results appear under the repository's **Security** tab (code scanning).
-Repository settings that complement these files: Dependabot alerts and
-security updates, secret scanning with push protection, private
-vulnerability reporting, and code scanning *advanced* setup (the CodeQL
-workflow; GitHub's default setup must stay off).
+CodeQL runs through GitHub's code scanning *default setup* (repository
+settings; the *Extended* query suite is recommended), so there is no CodeQL
+workflow file. Other repository settings that complement these files:
+Dependabot alerts and security updates, secret scanning with push
+protection, and private vulnerability reporting.
 
 ## Hardening guidance
 
